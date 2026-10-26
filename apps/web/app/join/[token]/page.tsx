@@ -19,14 +19,22 @@ export default function JoinPage() {
   }, [token, router]);
   return error ? (
     <div className="auth">
-      <div className="auth-card">
-        <div className="auth-logo">🌿</div>
-        <h1>Invite expired</h1>
-        <p className="muted">{error}</p>
-        <a className="btn primary block" href="/login">
-          Try Leaf yourself
+      <header className="auth-top">
+        <a className="auth-brand" href="/login">
+          <span className="auth-brand-icon">🌿</span> Leaf
         </a>
-      </div>
+      </header>
+      <main className="auth-main">
+        <div className="auth-col">
+          <h1 className="auth-title">
+            This invite has expired.
+            <span>{error}</span>
+          </h1>
+          <a className="auth-submit auth-link-btn" href="/login">
+            Try Leaf yourself
+          </a>
+        </div>
+      </main>
     </div>
   ) : (
     <div className="splash">🌿</div>

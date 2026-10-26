@@ -52,53 +52,84 @@ function LoginForm() {
     }
   };
 
+  const signup = mode === "signup";
   return (
     <div className="auth">
-      <div className="auth-card">
-        <div className="auth-logo">🌿</div>
-        <h1>{mode === "login" ? "Log in to Leaf" : "Create your Leaf account"}</h1>
-        <p className="muted">A small Notion, rebuilt from scratch.</p>
-        {demo?.guest && (
-          <div className="auth-try">
-            <button className="btn primary block try-btn" disabled={busy} onClick={() => void tryIt()} data-testid="try-leaf">
-              Try Leaf now: no sign-up
+      <header className="auth-top">
+        <a className="auth-brand" href="/login">
+          <span className="auth-brand-icon">🌿</span> Leaf
+        </a>
+        <a className="auth-top-link" href="https://github.com/sagarvarma1/leaf" target="_blank" rel="noreferrer">
+          View source
+        </a>
+      </header>
+      <main className="auth-main">
+        <div className="auth-col">
+          <h1 className="auth-title">
+            Write, plan, together.
+            <span>{signup ? "Create your Leaf account" : "Log in to your Leaf account"}</span>
+          </h1>
+
+          {demo?.guest && (
+            <button className="auth-btn" disabled={busy} onClick={() => void tryIt()} data-testid="try-leaf">
+              <span className="auth-btn-icon">✨</span> Try the live demo, no sign-up
             </button>
-            <div className="muted small">You get a private copy of the demo workspace for 24 hours, with an AI collaborator. Invite a friend from the sidebar to edit together.</div>
-            <div className="auth-or">or log in</div>
-          </div>
-        )}
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void submit();
-          }}
-        >
-          {mode === "signup" && <input className="input" placeholder="Your name" value={name} onChange={(e) => setName(e.target.value)} data-testid="auth-name" />}
-          <input className="input" type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" data-testid="auth-email" />
-          <input className="input" type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} data-testid="auth-password" />
-          {error && <div className="auth-error">{error}</div>}
-          <button className="btn primary block" disabled={busy} data-testid="auth-submit">
-            {mode === "login" ? "Continue" : "Sign up"}
+          )}
+          {demo?.demoUsers !== false && (
+            <>
+              <button className="auth-btn" disabled={busy} onClick={() => void submit({ email: "alice@leaf.dev", password: "leafdemo" })} data-testid="demo-alice">
+                <span className="avatar xs" style={{ background: "#e16259" }}>A</span> Continue as Alice (demo)
+              </button>
+              <button className="auth-btn" disabled={busy} onClick={() => void submit({ email: "bob@leaf.dev", password: "leafdemo" })} data-testid="demo-bob">
+                <span className="avatar xs" style={{ background: "#d9730d" }}>B</span> Continue as Bob (demo)
+              </button>
+            </>
+          )}
+          {demo?.guest && <p className="auth-hint">A private copy of the demo workspace for 24 hours, with the AI collaborator. Invite a friend from the sidebar to edit together.</p>}
+
+          {(demo?.guest || demo?.demoUsers !== false) && <div className="auth-sep" />}
+
+          <form
+            className="auth-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submit();
+            }}
+          >
+            {signup && (
+              <label className="auth-field">
+                <span>Name</span>
+                <input className="auth-input" placeholder="Enter your name…" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" data-testid="auth-name" />
+              </label>
+            )}
+            <label className="auth-field">
+              <span>Email</span>
+              <input className="auth-input" type="email" placeholder="Enter your email address…" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" data-testid="auth-email" />
+            </label>
+            <label className="auth-field">
+              <span>Password</span>
+              <input
+                className="auth-input"
+                type="password"
+                placeholder={signup ? "Choose a password…" : "Enter your password…"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete={signup ? "new-password" : "current-password"}
+                data-testid="auth-password"
+              />
+            </label>
+            {error && <div className="auth-error">{error}</div>}
+            <button className="auth-submit" disabled={busy} data-testid="auth-submit">
+              {signup ? "Sign up" : "Continue"}
+            </button>
+          </form>
+
+          <button className="auth-switch" onClick={() => (setMode(signup ? "login" : "signup"), setError(null))}>
+            {signup ? "Have an account? Log in" : "No account? Sign up"}
           </button>
-        </form>
-        <button className="link-btn" onClick={() => (setMode(mode === "login" ? "signup" : "login"), setError(null))}>
-          {mode === "login" ? "No account? Sign up" : "Have an account? Log in"}
-        </button>
-        {demo?.demoUsers !== false && (
-        <div className="auth-demo">
-          <div className="muted small">Demo accounts (password: leafdemo)</div>
-          <div className="row">
-            <button className="btn block" disabled={busy} onClick={() => void submit({ email: "alice@leaf.dev", password: "leafdemo" })} data-testid="demo-alice">
-              <span className="avatar xs" style={{ background: "#e16259" }}>A</span> Alice
-            </button>
-            <button className="btn block" disabled={busy} onClick={() => void submit({ email: "bob@leaf.dev", password: "leafdemo" })} data-testid="demo-bob">
-              <span className="avatar xs" style={{ background: "#d9730d" }}>B</span> Bob
-            </button>
-          </div>
-          <div className="muted small">Tip: open Bob in a private window to collaborate with Alice side by side.</div>
+          <p className="auth-legal">Leaf is an independent project built to explore how Notion works. It isn't affiliated with Notion Labs.</p>
         </div>
-        )}
-      </div>
+      </main>
     </div>
   );
 }

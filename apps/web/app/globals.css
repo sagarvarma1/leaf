@@ -2618,47 +2618,169 @@ td:hover .relation-add,
 /* ---------- auth ---------- */
 .auth {
   min-height: 100vh;
-  display: grid;
-  place-items: center;
-  background: var(--bg-sidebar);
-}
-.auth-card {
-  width: min(380px, 92vw);
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
-  border-radius: 12px;
-  box-shadow: var(--shadow);
-  padding: 32px 28px;
+}
+.auth-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 56px;
+  padding: 0 20px;
+}
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text);
+  text-decoration: none;
+}
+.auth-brand-icon {
+  font-size: 22px;
+}
+.auth-top-link {
+  font-size: 14px;
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 4px 10px;
+  border-radius: 6px;
+}
+.auth-top-link:hover {
+  background: var(--bg-hover);
+}
+.auth-main {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  padding: 9vh 16px 48px;
+}
+.auth-col {
+  width: 100%;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.auth-title {
+  font-size: 22px;
+  line-height: 1.25;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0 0 20px;
+  display: flex;
+  flex-direction: column;
+}
+.auth-title span {
+  color: var(--text-faint);
+}
+.auth-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 40px;
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong, rgba(55, 53, 47, 0.16));
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.auth-btn:hover {
+  background: var(--bg-hover);
+}
+.auth-btn:disabled,
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.auth-btn-icon {
+  font-size: 15px;
+}
+.auth-hint {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.auth-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 14px 0;
+}
+.auth-form {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  text-align: center;
 }
-.auth-card h1 {
-  font-size: 22px;
-  margin: 0;
-}
-.auth-card p {
-  margin: 0 0 8px;
-}
-.auth-card form {
+.auth-field {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
 }
-.auth-logo {
-  font-size: 40px;
+.auth-field > span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.auth-input {
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong, rgba(55, 53, 47, 0.16));
+  background: var(--bg-input, rgba(242, 241, 238, 0.6));
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  outline: none;
+}
+.auth-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(35, 131, 226, 0.2);
+}
+.auth-submit {
+  height: 40px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  margin-top: 4px;
+}
+.auth-submit:hover {
+  background: var(--accent-hover);
 }
 .auth-error {
   color: var(--danger);
   font-size: 13px;
 }
-.auth-demo {
-  border-top: 1px solid var(--border);
-  padding-top: 14px;
-  margin-top: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+.auth-switch {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 4px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.auth-legal {
+  margin: 28px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-faint);
 }
 
 @media (max-width: 860px) {
@@ -2683,31 +2805,6 @@ td:hover .relation-add,
 }
 
 /* ---------- guest sandbox ---------- */
-.auth-try {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 8px 0 4px;
-}
-.try-btn {
-  height: 40px;
-  font-size: 15px;
-}
-.auth-or {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--text-faint);
-  font-size: 12px;
-  margin-top: 6px;
-}
-.auth-or::before,
-.auth-or::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--border);
-}
 .sandbox {
   margin: 4px 8px 8px;
   padding: 8px 10px;
@@ -2770,4 +2867,10 @@ td:hover .relation-add,
   from {
     opacity: 0;
   }
+}
+.auth-link-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
 }
