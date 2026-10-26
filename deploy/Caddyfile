@@ -1,0 +1,5 @@
+# Add to the server's Caddyfile (replace the domain). Caddy gets the certificate and
+# proxies WebSocket upgrades automatically.
+api.leaf.example.com {
+	reverse_proxy 127.0.0.1:4000
+}

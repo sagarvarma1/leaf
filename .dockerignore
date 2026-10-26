@@ -1,0 +1,8 @@
+**/node_modules
+**/.next
+data
+docs
+scripts
+apps/web
+.env
+*.log

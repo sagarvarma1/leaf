@@ -1,0 +1,33 @@
+# Fly.io: the Leaf API + realtime server, one machine with a volume for SQLite.
+#   fly launch --no-deploy --copy-config --config deploy/fly.toml   (pick an app name)
+#   fly volumes create leaf_data --size 1
+#   fly secrets set ANTHROPIC_API_KEY=sk-ant-... LEAF_SECRET=$(openssl rand -hex 32)
+#   fly deploy --config deploy/fly.toml
+app = "leaf-api"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[env]
+  LEAF_DATA_DIR = "/data"
+  LEAF_SEED = "0"
+  LEAF_COOKIE_SECURE = "1"
+
+[mounts]
+  source = "leaf_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 4000
+  force_https = true
+  # One stateful process: live documents are held in memory, so never scale past one
+  # machine or let it sleep mid-session.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/api/health"
+    interval = "30s"
+    timeout = "5s"

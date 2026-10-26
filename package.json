@@ -1,0 +1,22 @@
+{
+  "name": "leaf",
+  "private": true,
+  "description": "Leaf: a working mini Notion. Block data model, Yjs CRDT collaboration, databases, comments, history.",
+  "packageManager": "pnpm@10.34.7",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "pnpm --filter @leaf/web build",
+    "start": "node scripts/dev.mjs --prod",
+    "test": "pnpm --filter @leaf/shared test && pnpm --filter @leaf/server test",
+    "typecheck": "pnpm -r typecheck",
+    "e2e": "node scripts/e2e.mjs",
+    "seed": "pnpm --filter @leaf/server seed",
+    "reset": "node scripts/reset.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

@@ -1,0 +1,20 @@
+# A VPS (e.g. the droplet that already runs Caddy): the Leaf API behind Caddy, which
+# terminates TLS and proxies WebSockets. Put your secrets in deploy/.env:
+#   ANTHROPIC_API_KEY=sk-ant-...
+#   LEAF_SECRET=<openssl rand -hex 32>
+#   docker compose -f deploy/docker-compose.yml up -d --build
+services:
+  leaf-api:
+    build: ..
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LEAF_DATA_DIR: /data
+      LEAF_SEED: "0"
+      LEAF_COOKIE_SECURE: "1"
+    volumes:
+      - leaf-data:/data
+    ports:
+      - "127.0.0.1:4000:4000"
+volumes:
+  leaf-data:

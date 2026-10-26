@@ -1,0 +1,11 @@
+node_modules
+.next
+*.tsbuildinfo
+next-env.d.ts.bak
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+test-results/
+docs/screenshots/tmp/
