@@ -2,7 +2,7 @@
 import type { Block } from "@leaf/shared";
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { pageTitle, refreshMembers, useWorkspace } from "@/lib/store";
+import { getState, isAlive, pageTitle, refreshMembers, useWorkspace } from "@/lib/store";
 import { Avatar, Icon, Modal } from "./ui";
 
 const navigate = (id: string | null) => window.dispatchEvent(new CustomEvent("leaf-navigate", { detail: id }));
@@ -27,6 +27,17 @@ function Snippet({ text }: { text: string }) {
   );
 }
 
+/** Offline fallback: match page titles from the local workspace cache. */
+function offlineSearch(q: string): Result[] {
+  const s = getState();
+  const needle = q.trim().toLowerCase();
+  return Object.values(s.blocks)
+    .filter((b) => b.type === "page" && isAlive(s, b.id) && pageTitle(b).toLowerCase().includes(needle))
+    .sort((a, b) => b.last_edited_at - a.last_edited_at)
+    .slice(0, 20)
+    .map((b) => ({ id: b.id, title: pageTitle(b), icon: b.properties.icon ?? null, snippet: "", path: "" }));
+}
+
 export function QuickFind({ workspaceId, onClose }: { workspaceId: string; onClose: () => void }) {
   const [q, setQ] = useState("");
   const [results, setResults] = useState<Result[]>([]);
@@ -35,12 +46,14 @@ export function QuickFind({ workspaceId, onClose }: { workspaceId: string; onClo
   useEffect(() => {
     const n = ++seq.current;
     const t = setTimeout(() => {
-      api<{ results: Result[] }>("GET", `/api/workspaces/${workspaceId}/search?q=${encodeURIComponent(q)}`).then((r) => {
-        if (n === seq.current) {
-          setResults(r.results);
-          setIndex(0);
-        }
-      });
+      api<{ results: Result[] }>("GET", `/api/workspaces/${workspaceId}/search?q=${encodeURIComponent(q)}`)
+        .catch(() => ({ results: offlineSearch(q) }))
+        .then((r) => {
+          if (n === seq.current) {
+            setResults(r.results);
+            setIndex(0);
+          }
+        });
     }, 80);
     return () => clearTimeout(t);
   }, [q, workspaceId]);

@@ -35,8 +35,12 @@ section says exactly where it stops.
   every other page, with remote cursors inside it. Search credits every page that shows it.
 - **Real-time collaboration**: one Yjs document per page, synced over a WebSocket server I wrote
   (the y-websocket wire protocol, with auth, read-only enforcement and persistence added). You get
-  named, colored cursors, avatars of who is on the page, offline edits (kept in IndexedDB) that
-  merge on reconnect, and per-user undo.
+  named, colored cursors, avatars of who is on the page, and per-user undo.
+- **Offline mode**: Leaf works on a plane. A service worker serves the app shell, and pages are
+  downloaded to IndexedDB in the background, including ones you've never opened. You can cold-start
+  the app with no network, open any page, edit it, and reload. Edits merge with everyone else's
+  on reconnect, with no conflict dialogs. The UI shows what's saved on this device and how many
+  changes are waiting.
 - **Leaf AI**: an agent (Claude Opus 5.5, tool use) that **joins the page as a collaborator**. It
   appears in everyone's presence list with its own cursor, and its text is typed into the shared
   document as it writes. It reads pages, writes and rewrites blocks, searches the workspace,
@@ -189,10 +193,26 @@ two clients could "fix" the same thing at once and duplicate content.
 removes them when the socket closes, so stale cursors don't linger. Leaf AI's cursor is a
 server-side awareness state, positioned with Yjs relative positions inside the text it's typing.
 
-**Offline and reconnect.** The browser keeps each document in IndexedDB. Edits made offline land
-locally, and on reconnect the y-websocket handshake exchanges state vectors and sends only the
-missing updates. The editor is created only once the doc has content, so two clients never each
-insert a default paragraph.
+**Offline mode.** There are two layers, kept separate on purpose:
+
+- **Content** is the CRDT. The browser keeps each page's Yjs document in IndexedDB. After the
+  workspace loads, `lib/offline.ts` downloads up to 80 pages one at a time in the background:
+  favorites and recent pages first, skipping any whose copy is already newer than their last
+  edit, and following synced blocks into their own documents. On reconnect the y-websocket
+  handshake exchanges state vectors and sends only the missing updates. Offline edits are
+  ordinary CRDT updates, so there's nothing to resolve.
+- **The shell** comes from `public/sw.js`, which is network-first for every same-origin GET and
+  falls back to the last good copy. Online behaviour is unchanged (no stale UI after a deploy).
+  Offline, the HTML, scripts and the read-only API responses the UI needs (session, page tree,
+  page metadata, comments) come from the cache. Offline page switches load the document itself,
+  because Next's client-side navigation needs a server round trip.
+- **Honest scope:** actions that change the structure server-side (creating pages, database cells,
+  comments) are server-ordered. They fail with "You're offline" instead of being queued.
+  Search falls back to matching page titles. Logging out wipes the caches and the local
+  documents.
+
+The editor is created only once the doc has content, so two clients never each insert a default
+paragraph.
 
 ### Conflict handling
 
@@ -257,10 +277,12 @@ pnpm e2e         # 34 browser checks (Playwright, headless Chromium). Run `npx p
 - **Sandboxes and tickets** (6): isolation, invite links, rate limits, a sweep that leaves nothing
   behind (blocks, docs, users, links), and ticket signing, expiry, tampering and WebSocket auth.
 - **Persistence** (5): crash safety through the update log, compaction, paste re-keying, hydration, autosave.
-- **E2E** (34): Alice and Bob in separate browsers through:
+- **E2E** (35): Alice and Bob in separate browsers through:
   - presence, live and concurrent typing, the slash menu, markdown shortcuts, toolbar, per-user undo;
   - nesting and turn-into-with-children, columns via slash and drag-to-edge, drag reorder, block menu;
   - mentions, offline merge, sidebar operations;
+  - **offline mode with the network really cut** (service worker included): cold reload, open a
+    never-visited page, edit, reload again, then reconnect and converge with an online editor;
   - database table, board, filter, sort, relations, rollups, formulas (with live preview), calendar drag and gallery;
   - comments, ⌘K search, version restore, share links;
   - **Leaf AI typing live with its cursor and being discarded**, synced block edits across two pages;
@@ -312,6 +334,8 @@ pnpm e2e         # 34 browser checks (Playwright, headless Chromium). Run `npx p
   key: a public deployment should keep the per-user rate limit.
 - **Invites** add existing accounts (or guests via sandbox links). There's no email delivery and
   no password reset.
+- **Offline** covers page content. Creating pages, database edits and comments need a
+  connection, and only pages downloaded beforehand (up to 80 per workspace) open offline.
 - **Images take a URL**. There are no uploads.
 - **Mobile** layout is basic, and there's no accessibility audit.
 - Verified on macOS and Linux with Node 22, and in Docker (the production image).

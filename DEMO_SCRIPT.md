@@ -53,6 +53,17 @@ pnpm dev       # http://localhost:3000 (ANTHROPIC_API_KEY in .env for real Claud
 - On the roadmap, show **Days left** (a formula), then the **Calendar** view (drag a card to
   reschedule) and the **Gallery**.
 
+## Optional 15-second beat · Offline (record on the live link)
+
+- On the deployed site, turn **Wi-Fi off**. Turning off Wi-Fi doesn't cut `localhost`, so this
+  only works on the live link. The sidebar says "Offline · N pages on this device".
+- **Reload.** The app still opens. Click a page you've never opened, type a line, and the pill
+  counts "1 change saved on this device".
+- Wi-Fi back on: "✓ All changes synced", and the other window has the line.
+
+> "Pages are CRDT documents in IndexedDB, and a service worker serves the app shell. Offline edits
+> are just updates that haven't been delivered yet, so reconnecting needs no merge UI."
+
 ## 1:20 – 1:45 · Underneath
 
 - Open `/api/pages/<id>/blocks` or **⋯ → Export as Markdown**:

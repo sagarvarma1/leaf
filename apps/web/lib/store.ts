@@ -120,10 +120,20 @@ export async function refreshFavorites() {
 export const setFavorites = (favorites: string[]) => set({ favorites });
 
 let socket: WebSocket | null = null;
+let resume: (() => void) | null = null;
 let retry: ReturnType<typeof setTimeout> | null = null;
 let retryDelay = 500;
 
 async function connectEvents(workspaceId: string, share?: string | null) {
+  if (!navigator.onLine) {
+    // Offline: don't spin on reconnects; resume (and catch up) when the network returns.
+    resume = () => {
+      resume = null;
+      if (state.workspaceId === workspaceId) void connectEvents(workspaceId, share);
+    };
+    window.addEventListener("online", resume, { once: true });
+    return;
+  }
   const qs = new URLSearchParams({ workspace: workspaceId });
   if (share) qs.set("share", share);
   const ticket = share ? null : await wsTicket();
@@ -149,6 +159,7 @@ async function connectEvents(workspaceId: string, share?: string | null) {
   ws.onclose = () => {
     set({ connected: false });
     if (socket !== ws) return;
+    socket = null;
     retry = setTimeout(() => void connectEvents(workspaceId, share), retryDelay);
     retryDelay = Math.min(retryDelay * 2, 8000);
   };
@@ -158,7 +169,8 @@ export async function openWorkspace(workspaceId: string) {
   if (state.workspaceId === workspaceId && state.loaded) return;
   closeWorkspace();
   set({ workspaceId, loaded: false, blocks: {}, root: [] });
-  await Promise.all([refreshTree(), refreshMembers(), refreshFavorites()]);
+  // Members and favorites are nice-to-haves offline; the tree is required.
+  await Promise.all([refreshTree(), refreshMembers().catch(() => {}), refreshFavorites().catch(() => {})]);
   void connectEvents(workspaceId);
 }
 
@@ -171,6 +183,8 @@ export function openShared(workspaceId: string, token: string, blocks: Block[]) 
 
 export function closeWorkspace() {
   if (retry) clearTimeout(retry);
+  if (resume) window.removeEventListener("online", resume);
+  resume = null;
   const s = socket;
   socket = null;
   s?.close();

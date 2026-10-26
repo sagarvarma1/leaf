@@ -17,7 +17,14 @@ export async function api<T = any>(method: string, path: string, body?: unknown)
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["content-type"] = "application/json";
   if (shareToken) headers["x-leaf-share"] = shareToken;
-  const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
+  let res: Response;
+  try {
+    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
+  } catch {
+    // Reads are served from the offline cache by the service worker; anything that still
+    // fails needs the server (creating pages, database edits, comments).
+    throw new ApiError(0, navigator.onLine ? "Can't reach Leaf right now" : "You're offline. This needs a connection");
+  }
   const text = await res.text();
   let data: any = null;
   try {

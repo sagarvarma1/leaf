@@ -5,6 +5,7 @@ import { QuickFind, SettingsModal, TrashModal } from "@/components/Overlays";
 import { PageView } from "@/components/PageView";
 import { createPage, Sidebar } from "@/components/Sidebar";
 import { setShareToken } from "@/lib/api";
+import { isOnline, recentPages, touchRecent, useOnline, useServiceWorker, warmWorkspace } from "@/lib/offline";
 import { useSession } from "@/lib/session";
 import { childPages, getState, openWorkspace, useWorkspace } from "@/lib/store";
 
@@ -17,6 +18,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const loaded = useWorkspace((s) => s.loaded && s.workspaceId === ws);
   const [sidebar, setSidebar] = useState(true);
   const [overlay, setOverlay] = useState<null | "search" | "trash" | "settings">(null);
+  const online = useOnline();
+  useServiceWorker();
 
   useEffect(() => {
     setShareToken(null);
@@ -40,13 +43,30 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [loaded, pageId, ws, router]);
 
   useEffect(() => {
-    if (pageId) localStorage.setItem("leaf:last", JSON.stringify({ ws, page: pageId }));
+    if (!pageId) return;
+    localStorage.setItem("leaf:last", JSON.stringify({ ws, page: pageId }));
+    touchRecent(pageId);
   }, [ws, pageId]);
+
+  // Offline mode: once the workspace is up (and again after coming back online), download
+  // pages in the background so they open without a connection.
+  useEffect(() => {
+    if (!loaded || !online) return;
+    const t = setTimeout(() => {
+      const s = getState();
+      void warmWorkspace(ws, s.blocks, [...(pageId ? [pageId] : []), ...s.favorites, ...recentPages(), ...childPages(s, null).map((b) => b.id)]);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [loaded, online, ws]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const nav = (e: Event) => {
       const id = (e as CustomEvent).detail as string | null;
-      router.push(id ? `/w/${ws}/${id}` : `/w/${ws}`);
+      const url = id ? `/w/${ws}/${id}` : `/w/${ws}`;
+      // Client-side navigation needs a server round trip for the route payload. Offline,
+      // load the page itself instead: the service worker serves it from cache.
+      if (!isOnline()) location.assign(url);
+      else router.push(url);
     };
     const key = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;

@@ -17,6 +17,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
+// Let context.route() see the service worker's own requests, so "offline" really cuts
+// off the worker too (setOffline alone doesn't reach it).
+process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = "1";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const API_PORT = Number(process.env.E2E_API_PORT ?? 4310);
 const WEB_PORT = Number(process.env.E2E_WEB_PORT ?? 3310);
@@ -792,6 +796,64 @@ async function main() {
     assert((await A.request.get(`${WEB}/api/workspaces/${ws}/pages`)).status() === 403, "Alice can't read a guest sandbox");
     await ctx1.close();
     await ctx2.close();
+  });
+
+  await test("offline mode: cold reload, open an unvisited page, edit, then sync", async () => {
+    const ctxO = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+    const goOffline = async () => {
+      await ctxO.setOffline(true);
+      await ctxO.route("**", (r) => r.abort("internetdisconnected"));
+    };
+    const goOnline = async () => {
+      await ctxO.unrouteAll({ behavior: "ignoreErrors" });
+      await ctxO.setOffline(false);
+    };
+    try {
+      const O = await login(ctxO, "alice");
+      const ws = O.url().split("/w/")[1].split("/")[0];
+      const { blocks } = await (await O.request.get(`${WEB}/api/workspaces/${ws}/pages`)).json();
+      const arch = blocks.find((b) => b.type === "page" && b.properties.title === "Architecture" && !b.archived);
+      // The service worker takes control, and the background download finishes.
+      await until(() => O.evaluate(() => !!navigator.serviceWorker.controller), "service worker controls the page", 20_000);
+      await until(() => O.evaluate(() => window.__leafWarm && !window.__leafWarm.running && window.__leafWarm.total > 0), "pages saved for offline", 60_000);
+      const saved = await O.evaluate(() => JSON.parse(localStorage.getItem("leaf:offline") ?? "{}"));
+      assert(saved[arch.id], "Architecture (never opened) was downloaded");
+
+      await goOffline();
+      // A cold reload with no network: shell from the service worker, content from IndexedDB.
+      await O.reload();
+      await O.waitForSelector("[data-testid=editor]", { timeout: 20_000 });
+      await until(async () => (await O.locator("[data-testid=offline-status]").innerText()).includes("on this device"), "sidebar says offline");
+      // Open a page this tab has never displayed.
+      await O.evaluate((id) => window.dispatchEvent(new CustomEvent("leaf-navigate", { detail: id })), arch.id);
+      await until(async () => (await O.locator(".leaf-editor .page-title").innerText()).trim() === "Architecture", "Architecture opens offline", 20_000);
+      assert((await editorText(O)).includes("Offline edits merge on reconnect"), "content came from the local replica");
+      await caretToEnd(O);
+      await O.keyboard.press("Enter");
+      await O.keyboard.type("Written on a plane");
+      await until(async () => /change.*saved on this device/.test(await O.locator("[data-testid=offline-pill]").innerText()), "pill counts offline changes");
+      await shot(O, "offline-mode");
+      // Survives another reload while still offline.
+      await sleep(300);
+      await O.reload();
+      await O.waitForSelector("[data-testid=editor]", { timeout: 20_000 });
+      await until(async () => (await editorText(O)).includes("Written on a plane"), "offline edit persisted locally");
+
+      // Bob, online, hasn't seen it. Then Alice reconnects and it merges.
+      await gotoPage(B, "Architecture");
+      await caretToEnd(B);
+      await B.keyboard.press("Enter");
+      await B.keyboard.type("Bob was online");
+      assert(!(await editorText(B)).includes("Written on a plane"), "not synced while offline");
+      await goOnline();
+      await until(async () => (await editorText(B)).includes("Written on a plane"), "Bob receives the offline edit", 30_000);
+      await until(async () => (await editorText(O)).includes("Bob was online"), "Alice receives Bob's edit", 30_000);
+      await until(async () => (await docXml(O)) === (await docXml(B)), "documents converge");
+      await until(async () => (await O.locator("[data-testid=synced-pill]").count()) === 1, "synced confirmation");
+    } finally {
+      await goOnline().catch(() => {});
+      await ctxO.close();
+    }
   });
 
   await test("sign up a new user, who is denied a workspace they are not in", async () => {

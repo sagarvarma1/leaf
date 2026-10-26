@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useSyncExternalStore } from "react";
 import { api, clearWsTicket } from "./api";
+import { clearOfflineData } from "./offline";
 import type { User } from "./store";
 
 export interface Session {
@@ -50,6 +51,7 @@ export function useSession(): Session {
 export async function logout() {
   await api("POST", "/api/auth/logout");
   clearWsTicket();
+  await clearOfflineData();
   localStorage.removeItem("leaf:last");
   set({ user: null, workspaces: [], loaded: true });
 }

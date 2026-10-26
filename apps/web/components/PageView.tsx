@@ -3,7 +3,8 @@ import type { Block } from "@leaf/shared";
 import type { Editor as TEditor } from "@tiptap/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { useCollab } from "@/lib/collab";
+import { useCollab, type Collab } from "@/lib/collab";
+import { keepUrls, useOnline } from "@/lib/offline";
 import { setFavorites, upsertBlocks, useBlock, useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/session";
 import { AiPanel, useAiStatus } from "./AiPanel";
@@ -60,6 +61,7 @@ export function PageView({
   const { comments } = useComments(pageId);
   const [, setTheme] = useTheme();
   const editorRef = useRef<TEditor | null>(null);
+  const online = useOnline();
 
   useEffect(() => {
     setMeta(null);
@@ -71,8 +73,11 @@ export function PageView({
         setMeta(r);
         upsertBlocks([r.page, ...(r.database ? [r.database] : [])]);
       })
-      .catch((e) => setError(e instanceof ApiError ? e.message : "Could not open this page"));
-  }, [pageId]);
+      .catch((e) => setError(e instanceof ApiError && e.status === 0 ? "offline" : e instanceof ApiError ? e.message : "Could not open this page"));
+    // Keep this page's shell and metadata for offline use (opened via client navigation,
+    // its HTML was never fetched as a document).
+    if (!share) keepUrls([location.pathname, `/api/pages/${pageId}`, `/api/pages/${pageId}/comments`]);
+  }, [pageId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const readOnly = !meta || meta.access !== "edit" || !me;
   const user = useMemo(() => ({ name: me?.name ?? "Guest", color: me?.color ?? "#999" }), [me?.name, me?.color]);
@@ -120,6 +125,17 @@ export function PageView({
     setDraftBlock(blockId);
   }, []);
 
+  // Offline and this page was never downloaded to this device.
+  if (error === "offline" || (!online && collab?.local && !collab.ready)) {
+    return (
+      <div className="page-error" data-testid="not-offline">
+        <div className="page-error-icon">☁️</div>
+        <div>This page isn't saved on this device yet.</div>
+        <div className="muted small">It will open once you're back online.</div>
+      </div>
+    );
+  }
+
   if (error) {
     return (
       <div className="page-error">
@@ -162,11 +178,7 @@ export function PageView({
           ))}
         </nav>
         <div className="topbar-right">
-          {collab && collab.status !== "connected" && (
-            <span className="status-pill" data-testid="offline-pill" title="Edits are kept locally and merge when you reconnect">
-              {collab.status === "connecting" ? "Connecting…" : "Offline · saved locally"}
-            </span>
-          )}
+          {collab && <SyncStatus collab={collab} online={online} />}
           {meta?.access === "view" && <span className="status-pill muted">View only</span>}
           {page && <span className="muted small edited">Edited {timeAgo(page.last_edited_at)}</span>}
           <div className="presence" data-testid="presence">
@@ -180,7 +192,7 @@ export function PageView({
               Share
             </button>
           )}
-          {meta?.isMember && !readOnly && aiStatus?.enabled && (
+          {meta?.isMember && !readOnly && aiStatus?.enabled && online && (
             <button className={`btn ghost small ai-btn ${panel === "ai" ? "on" : ""}`} title="Leaf AI" data-testid="ai-btn" onClick={() => (setPanel(panel === "ai" ? null : "ai"), setAiBlock(null))}>
               <Icon name="sparkle" size={14} /> AI
             </button>
@@ -335,5 +347,49 @@ export function PageView({
         </Popover>
       )}
     </div>
+  );
+}
+
+/**
+ * Connection state for the open page. Offline edits are CRDT updates kept in IndexedDB, so
+ * the message is "saved on this device", then "synced" once the server has merged them.
+ */
+function SyncStatus({ collab, online }: { collab: Collab; online: boolean }) {
+  const [flash, setFlash] = useState(false);
+  const hadPending = useRef(0);
+  const live = collab.status === "connected" && collab.synced;
+  useEffect(() => {
+    if (!live) {
+      hadPending.current = Math.max(hadPending.current, collab.pending);
+      return;
+    }
+    if (!hadPending.current) return;
+    hadPending.current = 0;
+    setFlash(true);
+    const t = setTimeout(() => setFlash(false), 2500);
+    return () => clearTimeout(t);
+  }, [live, collab.pending]);
+
+  if (live) {
+    return flash ? (
+      <span className="status-pill synced" data-testid="synced-pill">
+        ✓ All changes synced
+      </span>
+    ) : null;
+  }
+  const n = collab.pending;
+  const offline = !online || collab.status === "disconnected";
+  return (
+    <span className={`status-pill ${offline ? "offline" : ""}`} data-testid="offline-pill" title="Edits are kept on this device and merge with everyone else's when you reconnect">
+      {offline ? (
+        <>
+          <span className="pill-dot" /> Offline · {n ? `${n} change${n === 1 ? "" : "s"} saved on this device` : "saved on this device"}
+        </>
+      ) : n ? (
+        `Syncing ${n} change${n === 1 ? "" : "s"}…`
+      ) : (
+        "Connecting…"
+      )}
+    </span>
   );
 }

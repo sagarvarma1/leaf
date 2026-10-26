@@ -2,6 +2,7 @@
 import type { Block } from "@leaf/shared";
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { useOnline, useSavedPages, useWarmState } from "@/lib/offline";
 import { logout, useTheme, type Session } from "@/lib/session";
 import { childPages, getState, isAlive, pageTitle, upsertBlocks, useWorkspace } from "@/lib/store";
 import { Avatar, EmojiPicker, Icon, Popover } from "./ui";
@@ -56,6 +57,8 @@ export function Sidebar({
   const roots = useWorkspace((s) => childPages(s, null));
   const favorites = useWorkspace((s) => s.favorites.map((id) => s.blocks[id]).filter((b): b is Block => !!b && isAlive(s, b.id)));
   const connected = useWorkspace((s) => s.connected);
+  const online = useOnline();
+  const saved = useSavedPages();
   const { open, toggle } = useExpanded();
   const [wsMenu, setWsMenu] = useState<HTMLElement | null>(null);
   const [theme, setTheme] = useTheme();
@@ -125,7 +128,12 @@ export function Sidebar({
           <div className="sb-section">
             <div className="sb-label">Favorites</div>
             {favorites.map((b) => (
-              <button key={b.id} className={`sb-item tree-row ${b.id === currentId ? "active" : ""}`} onClick={() => navigate(b.id)}>
+              <button
+                key={b.id}
+                className={`sb-item tree-row ${b.id === currentId ? "active" : ""} ${!online && !saved[b.id] ? "unavailable" : ""}`}
+                title={!online && !saved[b.id] ? "Not saved on this device" : undefined}
+                onClick={() => (online || saved[b.id]) && navigate(b.id)}
+              >
                 <span className="tree-icon">{b.properties.icon || "📄"}</span>
                 <span className="tree-title">{pageTitle(b)}</span>
               </button>
@@ -154,6 +162,7 @@ export function Sidebar({
           </div>
         </div>
       </div>
+      <OfflineStatus online={online} />
       <div className="sb-bottom">
         <button className="sb-item" onClick={onTrash} data-testid="open-trash">
           <Icon name="trash" size={15} /> Trash
@@ -215,6 +224,9 @@ function TreeItem({
   const [emoji, setEmoji] = useState<HTMLElement | null>(null);
   const [dropMode, setDropMode] = useState<DropMode | null>(null);
   const isOpen = open.has(page.id);
+  const online = useOnline();
+  const saved = useSavedPages();
+  const unavailable = !online && !saved[page.id];
 
   const rename = async (title: string) => {
     setRenaming(false);
@@ -227,7 +239,8 @@ function TreeItem({
   return (
     <div className="tree-node">
       <div
-        className={`tree-row sb-item ${page.id === currentId ? "active" : ""} ${dropMode ? `drop-${dropMode}` : ""}`}
+        className={`tree-row sb-item ${page.id === currentId ? "active" : ""} ${dropMode ? `drop-${dropMode}` : ""} ${unavailable ? "unavailable" : ""}`}
+        title={unavailable ? "Not saved on this device" : undefined}
         style={{ paddingLeft: 8 + depth * 14 }}
         draggable={!renaming}
         data-testid="tree-row"
@@ -251,7 +264,7 @@ function TreeItem({
           setDropMode(null);
           onDrop(page, m);
         }}
-        onClick={() => !renaming && navigate(page.id)}
+        onClick={() => !renaming && !unavailable && navigate(page.id)}
         onDoubleClick={() => {
           setName(page.properties.title ?? "");
           setRenaming(true);
@@ -375,6 +388,27 @@ function TreeItem({
             void api<{ page: Block }>("PATCH", `/api/pages/${page.id}`, { icon }).then((r) => upsertBlocks([r.page]));
           }}
         />
+      )}
+    </div>
+  );
+}
+
+/** Offline mode: what's on this device, and the background download's progress. */
+function OfflineStatus({ online }: { online: boolean }) {
+  const saved = useSavedPages();
+  const warm = useWarmState();
+  const pages = useWorkspace((s) => Object.keys(saved).filter((id) => s.blocks[id]?.type === "page" && !s.blocks[id]!.archived).length);
+  if (online && !warm.running) return null;
+  return (
+    <div className={`offline-status ${online ? "" : "off"}`} data-testid="offline-status">
+      {online ? (
+        <>
+          <Icon name="download" size={13} /> Saving pages for offline… {warm.done}/{warm.total}
+        </>
+      ) : (
+        <>
+          <span className="pill-dot" /> Offline · {pages} page{pages === 1 ? "" : "s"} on this device
+        </>
       )}
     </div>
   );

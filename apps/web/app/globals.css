@@ -2728,3 +2728,46 @@ td:hover .relation-add,
   font-size: 12px;
   height: 28px;
 }
+
+/* ---------------------------------------------------------------- offline mode */
+.status-pill.offline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-active);
+  color: var(--text-muted);
+}
+.status-pill.synced {
+  background: rgba(15, 123, 108, 0.12);
+  color: #0f7b6c;
+  animation: fade-in 0.2s ease;
+}
+.pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #9b9a97;
+  flex: none;
+}
+.offline-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 4px 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.offline-status.off {
+  background: var(--bg-active);
+}
+.tree-row.unavailable {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
