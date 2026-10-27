@@ -1,55 +1,23 @@
 /**
- * WebSocket endpoints.
+ * WebSocket endpoint: /ws/events, one socket per client (Leaf's MessageStore).
  *
- *   /ws/doc/<pageId>   Yjs sync + awareness for one page (the y-websocket wire protocol,
- *                      implemented here so we control auth, read-only and persistence).
- *   /ws/events         Workspace event stream (structure changes, comments, versions).
+ * Server -> client: workspace events, commits for the documents the client follows, and
+ * presence. Client -> server:
+ *   { type: "sub", docs: [...] }              which documents to follow (open + offline pages)
+ *   { type: "presence", doc, sel }            where my cursor is in a document (sel null: no caret)
+ *   { type: "presence", doc, leave: true }    I closed that document
+ * Writes don't go through the socket: clients POST transactions (see http.ts), like
+ * Notion's /saveTransactions, and the server broadcasts the commit here.
  */
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import * as decoding from "lib0/decoding";
-import * as encoding from "lib0/encoding";
 import { WebSocket, WebSocketServer } from "ws";
-import * as awarenessProtocol from "y-protocols/awareness";
-import * as syncProtocol from "y-protocols/sync";
 import type { Leaf, User } from "./app.js";
 import { parseCookies, SESSION_COOKIE, verifyTicket } from "./auth.js";
-import type { ConnInfo, LiveDoc, Origin } from "./docs.js";
-
-const MSG_SYNC = 0;
-const MSG_AWARENESS = 1;
-const MSG_QUERY_AWARENESS = 3;
+import type { Subscriber } from "./hub.js";
 
 export function attachRealtime(leaf: Leaf) {
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
-  const withAwareness = new WeakSet<LiveDoc>();
-
-  leaf.docs.onUpdate = (live, update, origin) => {
-    const enc = encoding.createEncoder();
-    encoding.writeVarUint(enc, MSG_SYNC);
-    syncProtocol.writeUpdate(enc, update);
-    const msg = encoding.toUint8Array(enc);
-    const from = (origin as Origin | null)?.conn;
-    for (const c of live.conns) if (c !== from) c.send(msg);
-  };
-
-  function installAwareness(live: LiveDoc) {
-    if (withAwareness.has(live)) return;
-    withAwareness.add(live);
-    live.awareness.on("update", ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
-      const changed = [...added, ...updated, ...removed];
-      const conn = (origin as { conn?: ConnInfo } | null)?.conn;
-      if (conn) {
-        for (const id of added) conn.awarenessIds.add(id);
-        for (const id of removed) conn.awarenessIds.delete(id);
-      }
-      const enc = encoding.createEncoder();
-      encoding.writeVarUint(enc, MSG_AWARENESS);
-      encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(live.awareness, changed));
-      const msg = encoding.toUint8Array(enc);
-      for (const c of live.conns) c.send(msg);
-    });
-  }
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
   /** Session cookie (same-site deployments), a signed ticket (cross-site), or a bearer token (scripts). */
   function authenticate(req: IncomingMessage, url: URL): User | null {
@@ -75,114 +43,56 @@ export function attachRealtime(leaf: Leaf) {
     ws.on("close", () => clearInterval(timer));
   }
 
-  function handleDoc(ws: WebSocket, live: LiveDoc, user: User | null, readOnly: boolean) {
-    installAwareness(live);
-    if (live.unloadTimer) {
-      clearTimeout(live.unloadTimer);
-      live.unloadTimer = null;
-    }
-    const conn: ConnInfo = {
-      userId: user?.id ?? null,
-      readOnly,
-      awarenessIds: new Set(),
-      send(data) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(data, (err) => err && ws.terminate());
-      },
-    };
-    live.conns.add(conn);
-    const origin: Origin = { conn };
-
-    ws.on("message", (raw: Buffer) => {
-      try {
-        const decoder = decoding.createDecoder(new Uint8Array(raw));
-        const enc = encoding.createEncoder();
-        const type = decoding.readVarUint(decoder);
-        if (type === MSG_SYNC) {
-          encoding.writeVarUint(enc, MSG_SYNC);
-          if (readOnly) {
-            // Viewers may ask for state (step 1) but their updates are ignored.
-            const sub = decoding.readVarUint(decoder);
-            if (sub === syncProtocol.messageYjsSyncStep1) syncProtocol.readSyncStep1(decoder, enc, live.doc);
-          } else {
-            syncProtocol.readSyncMessage(decoder, enc, live.doc, origin);
-          }
-          if (encoding.length(enc) > 1) conn.send(encoding.toUint8Array(enc));
-        } else if (type === MSG_AWARENESS) {
-          awarenessProtocol.applyAwarenessUpdate(live.awareness, decoding.readVarUint8Array(decoder), origin);
-        } else if (type === MSG_QUERY_AWARENESS) {
-          encoding.writeVarUint(enc, MSG_AWARENESS);
-          encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(live.awareness, [...live.awareness.getStates().keys()]));
-          conn.send(encoding.toUint8Array(enc));
-        }
-      } catch (err) {
-        console.error("[ws] bad message", err);
-      }
-    });
-
-    ws.on("close", () => {
-      live.conns.delete(conn);
-      awarenessProtocol.removeAwarenessStates(live.awareness, [...conn.awarenessIds], null);
-      if (live.conns.size === 0) {
-        leaf.docs.project(live.pageId);
-        leaf.docs.persist(live.pageId);
-        leaf.docs.scheduleUnload(live.pageId);
-      }
-    });
-
-    // Sync step 1 from the server, plus everyone's current presence.
-    const enc = encoding.createEncoder();
-    encoding.writeVarUint(enc, MSG_SYNC);
-    syncProtocol.writeSyncStep1(enc, live.doc);
-    conn.send(encoding.toUint8Array(enc));
-    const states = [...live.awareness.getStates().keys()];
-    if (states.length) {
-      const a = encoding.createEncoder();
-      encoding.writeVarUint(a, MSG_AWARENESS);
-      encoding.writeVarUint8Array(a, awarenessProtocol.encodeAwarenessUpdate(live.awareness, states));
-      conn.send(encoding.toUint8Array(a));
-    }
-  }
-
   function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
     const url = new URL(req.url ?? "/", "http://localhost");
+    if (url.pathname !== "/ws/events") return reject(socket, 404, "Not Found");
     const user = authenticate(req, url);
     const share = url.searchParams.get("share");
+    const workspaceId = url.searchParams.get("workspace") ?? "";
+    const member = Boolean(user && leaf.isMember(user.id, workspaceId));
+    const link = leaf.shareLinkByToken(share);
+    if (!member && !link) return reject(socket, user ? 403 : 401, "Forbidden");
+    const ws0 = member ? workspaceId : (leaf.store.get(link.page_id)?.workspace_id ?? "");
+    const session = (url.searchParams.get("session") ?? "").slice(0, 64) || undefined;
 
-    const docMatch = /^\/ws\/doc\/([\w-]+)$/.exec(url.pathname);
-    if (docMatch) {
-      const pageId = docMatch[1]!;
-      const page = leaf.store.get(pageId);
-      const ownsDoc = page && (page.type === "page" || (page.type === "synced_block" && !page.page_id));
-      if (!page || !ownsDoc) return reject(socket, 404, "Not Found");
-      const access = leaf.access(user?.id ?? null, pageId, share);
-      if (!access) return reject(socket, user ? 403 : 401, user ? "Forbidden" : "Unauthorized");
-      const live = leaf.docs.get(pageId);
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        keepAlive(ws);
-        handleDoc(ws, live, user, access !== "edit");
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      keepAlive(ws);
+      const sub: Subscriber = {
+        workspaceId: ws0,
+        member,
+        session,
+        user: user ? { id: user.id, name: user.name, color: user.color } : { id: `guest-${session ?? "x"}`, name: "Guest", color: "#9b9a97" },
+        docs: new Set(),
+        presence: new Map(),
+        canSee: (b) => member || leaf.store.ancestors(b.page_id ?? b.id).some((a) => a.id === link.page_id),
+        send: (json) => ws.readyState === WebSocket.OPEN && ws.send(json),
+      };
+      const remove = leaf.hub.add(sub);
+      ws.on("close", remove);
+      ws.on("message", (raw: Buffer) => {
+        let msg: any;
+        try {
+          msg = JSON.parse(String(raw));
+        } catch {
+          return;
+        }
+        if (msg?.type === "sub" && Array.isArray(msg.docs)) {
+          // Follow only documents this client may read.
+          const docs = msg.docs
+            .slice(0, 500)
+            .map(String)
+            .filter((id: string) => {
+              const b = leaf.store.get(id);
+              return !!b && b.workspace_id === ws0 && leaf.access(user?.id ?? null, id, share) !== null;
+            });
+          leaf.hub.subscribe(sub, docs);
+        } else if (msg?.type === "presence" && typeof msg.doc === "string") {
+          if (msg.leave) leaf.hub.setPresence(sub, msg.doc, null, true);
+          else if (sub.docs?.has(msg.doc)) leaf.hub.setPresence(sub, msg.doc, msg.sel ?? null);
+        }
       });
-      return;
-    }
-
-    if (url.pathname === "/ws/events") {
-      const workspaceId = url.searchParams.get("workspace") ?? "";
-      const member = user && leaf.isMember(user.id, workspaceId);
-      const link = leaf.shareLinkByToken(share);
-      if (!member && !link) return reject(socket, user ? 403 : 401, "Forbidden");
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        keepAlive(ws);
-        const remove = leaf.hub.add({
-          workspaceId: member ? workspaceId : leaf.store.get(link.page_id)?.workspace_id ?? "",
-          member: Boolean(member),
-          canSee: (b) => member || leaf.store.ancestors(b.page_id ?? b.id).some((a) => a.id === link.page_id),
-          send: (json) => ws.readyState === WebSocket.OPEN && ws.send(json),
-        });
-        ws.on("close", remove);
-        ws.send(JSON.stringify({ type: "hello" }));
-      });
-      return;
-    }
-    reject(socket, 404, "Not Found");
+      ws.send(JSON.stringify({ type: "hello" }));
+    });
   }
 
   return { wss, handleUpgrade };

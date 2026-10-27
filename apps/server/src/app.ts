@@ -1,38 +1,36 @@
 /**
  * Leaf application services. Every mutation goes through here; HTTP and WebSocket
- * handlers are thin adapters. Two write paths exist:
+ * handlers are thin adapters.
  *
- *   1. Page content (rich text blocks): a CRDT. Clients edit their Yjs replica; the
- *      server merges, logs, persists and projects into the block table. Server-side
- *      writes to content (REST block API, renames, sub-page links, restores) are
- *      applied as Yjs transactions via DocManager.mutate so editors receive them live.
- *   2. Structure (page tree, icons, covers, databases, cells, comments, sharing):
- *      server-authoritative operations committed in a SQLite transaction, then
- *      published to every subscribed client through the Hub.
+ * Writes follow Notion's model: blocks are records, and changes to them are operations
+ * committed by the sync service (sync.ts), which broadcasts each commit to the clients
+ * following the affected pages. Editors send transactions; the REST API, renames,
+ * page moves, version restores and the AI make the same kind of edit server-side.
+ * Database schemas, cells, comments and sharing are plain server-ordered writes
+ * published through the Hub.
  */
 import {
-  appendBlocks,
   applyDatabaseOp,
+  commitDesired,
+  createBlocks,
   defaultDatabase,
-  deleteBlock,
-  getFragment,
-  hasPageLink,
+  fromPM,
+  MemoryState,
   newId,
   normalizeValue,
+  ownSlice,
   pageToMarkdown,
-  projectFragment,
-  removePageLinks,
-  replaceFragment,
-  setBlockText,
-  setTitle,
+  setRichText,
+  TextInstance,
+  toPM,
   type Block,
   type BlockInput,
   type DatabaseOp,
   type DatabaseProperties,
   type RichText,
   type RowProperties,
+  type TextInstanceJSON,
   DatabaseOpError,
-  buildSequence,
   COMPUTED_TYPES,
   computedCell,
   displayValue,
@@ -40,11 +38,10 @@ import {
   type ValueContext,
 } from "@leaf/shared";
 import { randomUUID } from "node:crypto";
-import * as Y from "yjs";
 import { hashPassword, newToken, SESSION_TTL_MS, USER_COLORS, verifyPassword } from "./auth.js";
 import { openDb, tx, type DB } from "./db.js";
-import { DocManager, type DocOptions } from "./docs.js";
 import { Hub } from "./hub.js";
+import { SyncService, type SyncOptions } from "./sync.js";
 import { AiAgent } from "./ai/agent.js";
 import { createModel, type AiModel } from "./ai/model.js";
 import { BlockStore, HttpError } from "./store.js";
@@ -57,7 +54,7 @@ export interface User {
 }
 export type Access = "edit" | "view" | null;
 
-export interface LeafOptions extends Partial<DocOptions> {
+export interface LeafOptions extends Partial<SyncOptions> {
   dbFile: string;
   /** The model behind Leaf AI; defaults to Claude when credentials are set (or the mock with LEAF_AI_MOCK=1). */
   aiModel?: AiModel | null;
@@ -74,18 +71,17 @@ export class Leaf {
   readonly db: DB;
   readonly store: BlockStore;
   readonly hub = new Hub();
-  readonly docs: DocManager;
+  readonly sync: SyncService;
   readonly ai: AiAgent;
 
   constructor(opts: LeafOptions) {
     this.db = openDb(opts.dbFile);
     this.store = new BlockStore(this.db);
-    this.docs = new DocManager(this.db, this.store, this.hub, {
-      persistDebounceMs: opts.persistDebounceMs ?? 1000,
-      projectDebounceMs: opts.projectDebounceMs ?? 300,
+    this.sync = new SyncService(this.db, this.store, this.hub, {
       snapshotIntervalMs: opts.snapshotIntervalMs ?? 10 * 60 * 1000,
-      unloadAfterMs: opts.unloadAfterMs ?? 30_000,
+      indexDebounceMs: opts.indexDebounceMs ?? 400,
     });
+    this.sync.migrateText();
     this.ai = new AiAgent(this, opts.aiModel === undefined ? createModel() : opts.aiModel, {
       typingDelayMs: opts.aiTypingMs ?? Number(process.env.LEAF_AI_TYPING_MS ?? 16),
       maxRunsPerHour: Number(process.env.LEAF_AI_RUNS_PER_HOUR ?? 30),
@@ -94,7 +90,7 @@ export class Leaf {
 
   close() {
     this.ai.close();
-    this.docs.close();
+    this.sync.close();
     this.db.close();
   }
 
@@ -221,8 +217,11 @@ export class Leaf {
     const expired = this.db.prepare("SELECT id FROM workspaces WHERE expires_at IS NOT NULL AND expires_at < ?").all(at) as Array<{ id: string }>;
     for (const { id } of expired) {
       const pages = this.db.prepare("SELECT id FROM blocks WHERE workspace_id = ? AND (type = 'page' OR (type = 'synced_block' AND page_id IS NULL))").all(id) as Array<{ id: string }>;
-      for (const p of pages) this.docs.drop(p.id);
+      for (const p of pages) this.sync.drop(p.id);
       tx(this.db, () => {
+        // Every text instance is named after the block that created it.
+        this.db.prepare("DELETE FROM text_instances WHERE id IN (SELECT id FROM blocks WHERE workspace_id = ?)").run(id);
+        this.db.prepare("DELETE FROM block_instances WHERE block_id IN (SELECT id FROM blocks WHERE workspace_id = ?)").run(id);
         for (const p of pages) {
           this.db.prepare("DELETE FROM comments WHERE page_id = ?").run(p.id);
           this.db.prepare("DELETE FROM share_links WHERE page_id = ?").run(p.id);
@@ -314,6 +313,21 @@ export class Leaf {
 
   // ------------------------------------------------------------------ pages
 
+  /** Where to put a block after `afterId`: the container holding it, or the end of `doc`. */
+  insertionPoint(doc: string, afterId: string | null | undefined) {
+    return this.placeAfter(doc, afterId);
+  }
+
+  private placeAfter(doc: string, afterId: string | null | undefined): { parent: string; after: string | null } {
+    const docBlock = this.store.get(doc)!;
+    const last = docBlock.content[docBlock.content.length - 1] ?? null;
+    if (!afterId) return { parent: doc, after: last };
+    const anchor = this.store.get(afterId);
+    if (!anchor || anchor.archived) return { parent: doc, after: last };
+    const container = anchor.parent_id && this.store.get(anchor.parent_id)?.content.includes(afterId) ? anchor.parent_id : doc;
+    return { parent: container, after: this.store.get(container)!.content.includes(afterId) ? afterId : last };
+  }
+
   createPage(input: {
     workspaceId?: string;
     parentId?: string | null;
@@ -340,9 +354,9 @@ export class Leaf {
         const def = db.schema[k];
         if (def && k !== "title") values[k] = normalizeValue(def, v);
       }
-      properties = { title, icon: input.icon ?? null, values } satisfies RowProperties;
+      properties = { title: "", icon: input.icon ?? null, values } satisfies RowProperties;
     } else {
-      properties = { title, icon: input.icon ?? null, cover: input.cover ?? null };
+      properties = { title: "", icon: input.icon ?? null, cover: input.cover ?? null };
     }
     const page: Block = {
       id,
@@ -357,6 +371,7 @@ export class Leaf {
       last_edited_by: input.userId,
       last_edited_at: t,
       archived: false,
+      text: ownSlice(id),
     };
     const changed: Block[] = [];
     tx(this.db, () => {
@@ -367,46 +382,25 @@ export class Leaf {
         changed.push(this.store.get(parent.id)!);
       }
     });
-    // Build the page's document (title + body) and project it.
-    this.docs.mutate(id, input.userId, (frag) => {
-      if (frag.length) frag.delete(0, frag.length);
-      const titleEl = new Y.XmlElement("title");
-      if (title) titleEl.insert(0, [new Y.XmlText(title)]);
-      const body = input.content?.length ? input.content : [{ type: "paragraph" as const }];
-      frag.insert(0, [titleEl, ...buildSequence(body)]);
+    // Title, body, and the link in the parent page: one commit.
+    this.sync.edit(input.userId, ({ state, clock, apply }) => {
+      if (title) setRichText(state, clock, id, [{ text: title }], (op) => void apply(op));
+      createBlocks(state, clock, id, null, input.content?.length ? input.content : [{ type: "paragraph" }], (op) => void apply(op));
+      if (parent?.type === "page" && input.link !== false) apply({ op: "move", id, ...this.placeAfter(parent.id, input.afterBlockId) });
     });
-    if (parent?.type === "page" && input.link !== false) {
-      this.docs.mutate(parent.id, input.userId, (frag) => appendBlocks(frag, [{ id, type: "child_page" }], input.afterBlockId));
-    }
-    this.releaseIfIdle(id);
     changed.push(this.store.get(id)!);
     this.hub.publishBlocks(workspaceId, changed);
     return this.store.get(id)!;
   }
 
-  /** Unload a document nobody is editing (keeps memory bounded after bulk creates). */
-  private releaseIfIdle(pageId: string) {
-    const live = this.docs.docs.get(pageId);
-    if (live && live.conns.size === 0) this.docs.scheduleUnload(pageId);
-  }
-
   updatePage(id: string, userId: string | null, patch: { title?: string; icon?: string | null; cover?: string | null; fullWidth?: boolean }) {
     const page = this.store.require(id, "page");
     if (patch.title !== undefined) {
-      this.docs.mutate(id, userId, (frag) => setTitle(frag, String(patch.title)));
-      this.releaseIfIdle(id);
+      this.sync.edit(userId, ({ state, clock, apply }) => setRichText(state, clock, id, [{ text: String(patch.title) }], (op) => void apply(op)));
     }
-    const props: Record<string, any> = { ...this.store.get(id)!.properties };
-    let touched = false;
-    for (const k of ["icon", "cover", "fullWidth"] as const) {
-      if (patch[k] !== undefined) {
-        props[k] = patch[k];
-        touched = true;
-      }
-    }
-    if (touched) {
-      this.store.update(id, { properties: props, last_edited_by: userId, last_edited_at: now() });
-    }
+    const props: Record<string, any> = {};
+    for (const k of ["icon", "cover", "fullWidth"] as const) if (patch[k] !== undefined) props[k] = patch[k];
+    if (Object.keys(props).length) this.sync.edit(userId, ({ apply }) => apply({ op: "update", id, properties: props }));
     const updated = this.store.get(id)!;
     this.hub.publishBlocks(page.workspace_id, [updated]);
     return updated;
@@ -420,10 +414,16 @@ export class Leaf {
     if (newParent && newParent.workspace_id !== page.workspace_id) throw new HttpError(400, "Cross-workspace moves are not supported");
     if (newParent && this.store.ancestors(newParent.id).some((a) => a.id === id)) throw new HttpError(400, "Can't move a page inside itself");
 
-    // Re-parent first, so the projection of the old parent doesn't treat the removed
-    // link as a deletion.
+    this.sync.edit(userId, ({ apply }) => {
+      if (newParent) {
+        // Into a page: its link goes before `beforeId` (a sibling page) or at the end.
+        const content = this.store.get(newParent.id)!.content.filter((c) => c !== id);
+        const at = beforeId ? content.indexOf(beforeId) : -1;
+        const after = at > 0 ? content[at - 1]! : at === 0 ? null : (content[content.length - 1] ?? null);
+        apply({ op: "move", id, parent: newParent.id, after });
+      } else if (oldParent) apply({ op: "detach", id });
+    });
     tx(this.db, () => {
-      this.store.update(id, { parent_id: newParent?.id ?? null });
       const root = this.workspaceContent(page.workspace_id).filter((p) => p !== id);
       if (!newParent) {
         const at = beforeId ? root.indexOf(beforeId) : -1;
@@ -432,18 +432,6 @@ export class Leaf {
       }
       this.setWorkspaceContent(page.workspace_id, root);
     });
-    if (oldParent?.type === "page") this.docs.mutate(oldParent.id, userId, (frag) => removePageLinks(frag, id));
-    if (newParent) {
-      this.docs.mutate(newParent.id, userId, (frag) => {
-        removePageLinks(frag, id);
-        let anchorIdx = -1;
-        if (beforeId) {
-          anchorIdx = frag.toArray().findIndex((c) => c instanceof Y.XmlElement && c.nodeName === "pageLink" && c.getAttribute("pageId") === beforeId);
-        }
-        const [el] = buildSequence([{ id, type: "child_page" }]);
-        frag.insert(anchorIdx >= 0 ? anchorIdx : frag.length, [el!]);
-      });
-    }
     const changed = [this.store.get(id)!];
     if (oldParent) changed.push(this.store.get(oldParent.id)!);
     if (newParent) changed.push(this.store.get(newParent.id)!);
@@ -453,27 +441,23 @@ export class Leaf {
 
   trashPage(id: string, userId: string | null) {
     const page = this.store.require(id, ["page"]);
-    this.store.update(id, { archived: true, last_edited_by: userId, last_edited_at: now() });
-    const parent = page.parent_id ? this.store.get(page.parent_id) : null;
-    if (parent?.type === "page") this.docs.mutate(parent.id, userId, (frag) => removePageLinks(frag, id));
+    // Archive it and take its link out of the parent page (or row out of its database).
+    if (page.parent_id) this.sync.edit(userId, ({ apply }) => apply({ op: "delete", id }));
+    else this.store.update(id, { archived: true, last_edited_by: userId, last_edited_at: now() });
     this.db.prepare("DELETE FROM favorites WHERE page_id = ?").run(id);
     this.hub.publishBlocks(page.workspace_id, [this.store.get(id)!]);
   }
 
   restorePage(id: string, userId: string | null) {
     const page = this.store.require(id, ["page"]);
-    let parent = page.parent_id ? this.store.get(page.parent_id) : null;
-    if (parent && this.store.ancestors(parent.id).some((a) => a.archived)) {
+    const parent = page.parent_id ? this.store.get(page.parent_id) : null;
+    if (!parent || this.store.ancestors(parent.id).some((a) => a.archived)) {
       // Parent is gone: restore to the workspace root, like Notion.
-      this.store.update(id, { parent_id: null });
+      if (parent) this.sync.edit(userId, ({ apply }) => apply({ op: "detach", id }));
+      this.store.update(id, { archived: false, parent_id: null });
       this.setWorkspaceContent(page.workspace_id, [...this.workspaceContent(page.workspace_id).filter((p) => p !== id), id]);
-      parent = null;
-    }
-    this.store.update(id, { archived: false });
-    if (parent?.type === "page") {
-      this.docs.mutate(parent.id, userId, (frag) => {
-        if (!hasPageLink(frag, id)) appendBlocks(frag, [{ id, type: "child_page" }]);
-      });
+    } else {
+      this.sync.edit(userId, ({ apply }) => apply({ op: "restore", id, parent: parent.id, after: parent.content[parent.content.length - 1] ?? null }));
     }
     this.hub.publishBlocks(page.workspace_id, [this.store.get(id)!]);
   }
@@ -485,8 +469,11 @@ export class Leaf {
     tx(this.db, () => {
       for (const b of all) {
         if (b.type === "page") {
-          this.docs.drop(b.id);
+          this.sync.drop(b.id);
+          this.db.prepare("DELETE FROM text_instances WHERE id IN (SELECT id FROM blocks WHERE page_id = ?)").run(b.id);
+          this.db.prepare("DELETE FROM block_instances WHERE block_id IN (SELECT id FROM blocks WHERE page_id = ?)").run(b.id);
           this.db.prepare("DELETE FROM blocks WHERE page_id = ?").run(b.id);
+          this.db.prepare("DELETE FROM text_instances WHERE id = ?").run(b.id);
           this.db.prepare("DELETE FROM favorites WHERE page_id = ?").run(b.id);
           this.db.prepare("DELETE FROM comments WHERE page_id = ?").run(b.id);
           this.db.prepare("DELETE FROM share_links WHERE page_id = ?").run(b.id);
@@ -495,20 +482,15 @@ export class Leaf {
       }
       this.setWorkspaceContent(page.workspace_id, this.workspaceContent(page.workspace_id).filter((p) => p !== id));
       const parent = page.parent_id ? this.store.get(page.parent_id) : null;
-      if (parent?.type === "database") this.store.update(parent.id, { content: parent.content.filter((c) => c !== id) });
+      if (parent && parent.content.includes(id)) this.store.update(parent.id, { content: parent.content.filter((c) => c !== id) });
     });
     this.hub.publish(page.workspace_id, { type: "deleted", ids: all.map((b) => b.id) });
   }
 
-  /** The projected block tree of a page (fresh: projects the live doc first). */
+  /** A page and its content blocks. */
   pageBlocks(pageId: string) {
     const page = this.store.require(pageId, "page");
-    if (this.docs.docs.has(pageId)) this.docs.project(pageId);
-    else if (!this.db.prepare("SELECT 1 FROM ydocs WHERE doc_id = ?").get(pageId)) {
-      this.docs.get(pageId);
-      this.releaseIfIdle(pageId);
-    }
-    return { page: this.store.get(page.id)!, blocks: this.store.contentOf(pageId) };
+    return { page, blocks: this.store.contentOf(pageId) };
   }
 
   breadcrumbs(id: string) {
@@ -518,7 +500,7 @@ export class Leaf {
       .map((b) => ({ id: b.id, type: b.type, title: b.properties.title ?? "", icon: b.properties.icon ?? null }));
   }
 
-  // ------------------------------------------------------------------ content blocks (REST over the CRDT)
+  // ------------------------------------------------------------------ content blocks (REST)
 
   appendChildren(pageId: string, userId: string | null, children: BlockInput[], after?: string | null) {
     const owner = this.store.require(pageId, ["page", "synced_block"]);
@@ -528,36 +510,25 @@ export class Leaf {
       if (c.type === "child_page" || c.type === "child_database") throw new HttpError(400, "create pages and databases with their own endpoints");
       c.id = newId();
     }
-    this.docs.mutate(pageId, userId, (frag) => appendBlocks(frag, children, after));
-    this.releaseIfIdle(pageId);
+    const where = this.placeAfter(pageId, after);
+    this.sync.edit(userId, ({ state, clock, apply }) => createBlocks(state, clock, where.parent, where.after, children, (op) => void apply(op)));
     return children.map((c) => this.store.get(c.id!)).filter(Boolean);
   }
 
   updateBlock(blockId: string, userId: string | null, patch: { rich_text?: RichText; checked?: boolean }) {
     const b = this.store.require(blockId);
     if (!b.page_id) throw new HttpError(400, "Use the page endpoints for pages");
-    this.docs.mutate(b.page_id, userId, (frag) => {
-      if (patch.rich_text) setBlockText(frag, blockId, patch.rich_text);
-      if (patch.checked !== undefined) {
-        const walk = (p: Y.XmlFragment | Y.XmlElement): void => {
-          for (const k of p.toArray()) {
-            if (!(k instanceof Y.XmlElement)) continue;
-            if (k.getAttribute("blockId") === blockId) k.setAttribute("checked", Boolean(patch.checked) as any);
-            else walk(k);
-          }
-        };
-        walk(frag);
-      }
+    this.sync.edit(userId, ({ state, clock, apply }) => {
+      if (patch.rich_text && b.text) setRichText(state, clock, blockId, patch.rich_text, (op) => void apply(op));
+      if (patch.checked !== undefined) apply({ op: "update", id: blockId, properties: { checked: Boolean(patch.checked) } });
     });
-    this.releaseIfIdle(b.page_id);
     return this.store.get(blockId);
   }
 
   deleteContentBlock(blockId: string, userId: string | null) {
     const b = this.store.require(blockId);
     if (!b.page_id) throw new HttpError(400, "Use the page endpoints for pages");
-    this.docs.mutate(b.page_id, userId, (frag) => deleteBlock(frag, blockId));
-    this.releaseIfIdle(b.page_id);
+    this.sync.edit(userId, ({ apply }) => apply({ op: "delete", id: blockId }));
   }
 
   exportMarkdown(pageId: string): string {
@@ -628,7 +599,7 @@ export class Leaf {
       { title: "Third task", values: { status: "done" } },
     ];
     for (const r of rows) this.createPage({ parentId: id, userId: input.userId, title: r.title, values: r.values });
-    if (input.append) this.docs.mutate(page.id, input.userId, (frag) => appendBlocks(frag, [{ id, type: "child_database" }]));
+    if (input.append) this.sync.edit(input.userId, ({ apply }) => apply({ op: "move", id, ...this.placeAfter(page.id, null) }));
     const db = this.store.get(id)!;
     this.hub.publishBlocks(page.workspace_id, [db]);
     return db;
@@ -776,11 +747,9 @@ export class Leaf {
       archived: false,
     });
     const content = (input.content ?? []).filter((c) => c.type !== "child_page" && c.type !== "child_database" && c.type !== "synced_block");
-    this.docs.mutate(id, input.userId, (frag) => {
-      if (frag.length) frag.delete(0, frag.length);
-      frag.insert(0, buildSequence(content.length ? content : [{ type: "paragraph" }]));
-    });
-    this.releaseIfIdle(id);
+    this.sync.edit(input.userId, ({ state, clock, apply }) =>
+      createBlocks(state, clock, id, null, content.length ? content : [{ type: "paragraph" }], (op) => void apply(op)),
+    );
     return this.store.get(id)!;
   }
 
@@ -882,46 +851,62 @@ export class Leaf {
       .all(pageId);
   }
 
-  private snapshotDoc(versionId: string) {
+  /** A version as an in-memory copy of the page's records and text. */
+  private snapshotState(versionId: string) {
     const row = this.db.prepare("SELECT * FROM snapshots WHERE id = ?").get(versionId) as any;
     if (!row) throw new HttpError(404, "Version not found");
-    const doc = new Y.Doc();
-    Y.applyUpdate(doc, row.state);
-    return { row, doc };
+    const raw = typeof row.state === "string" ? row.state : Buffer.from(row.state).toString("utf8");
+    let snap: { records: Block[]; instances: TextInstanceJSON[] };
+    try {
+      snap = JSON.parse(raw);
+    } catch {
+      throw new HttpError(410, "This version was saved by an older version of Leaf");
+    }
+    const state = new MemoryState({
+      blocks: new Map(snap.records.map((b) => [b.id, b])),
+      instances: new Map(snap.instances.map((i) => [i.id, TextInstance.fromJSON(i)])),
+    });
+    // Child pages and databases it links to, as they are now.
+    for (const b of snap.records) for (const c of b.content) if (!state.getBlock(c)) {
+      const ref = this.store.get(c);
+      if (ref) state.putBlock(ref);
+    }
+    return { row, state };
   }
 
   versionPageId(versionId: string): string {
-    return this.snapshotDoc(versionId).row.page_id;
+    const row = this.db.prepare("SELECT page_id FROM snapshots WHERE id = ?").get(versionId) as any;
+    if (!row) throw new HttpError(404, "Version not found");
+    return row.page_id;
   }
 
   versionPreview(versionId: string) {
-    const { row, doc } = this.snapshotDoc(versionId);
-    const proj = projectFragment(getFragment(doc), row.page_id, {
-      isChildPage: (id) => this.store.get(id)?.parent_id === row.page_id,
-    });
-    const page = this.store.get(row.page_id)!;
-    const map = new Map<string, Block>(
-      proj.blocks.map((b) => [b.id, { ...b, workspace_id: page.workspace_id, page_id: row.page_id, created_by: null, created_at: 0, last_edited_by: null, last_edited_at: 0, archived: false }]),
-    );
-    const virtualPage: Block = { ...page, properties: { ...page.properties, title: proj.title }, content: proj.content };
-    const markdown = pageToMarkdown(virtualPage, { get: (id) => map.get(id) ?? this.store.get(id) });
-    doc.destroy();
-    return { id: row.id, title: proj.title, created_at: row.created_at, markdown };
+    const { row, state } = this.snapshotState(versionId);
+    const page = state.getBlock(row.page_id)!;
+    const markdown = pageToMarkdown(page, { get: (id) => state.getBlock(id) ?? this.store.get(id) });
+    return { id: row.id, title: page.properties.title ?? "", created_at: row.created_at, markdown };
   }
 
-  /** Restore = a new forward edit that makes the document equal the snapshot. */
+  /**
+   * Restore = a forward edit that makes the page equal the version: render the version
+   * the way the editor would, then commit that as the desired state (the same path an
+   * edit in the editor takes). People editing see it arrive like any other change.
+   */
   restoreVersion(versionId: string, userId: string | null) {
-    const { row, doc } = this.snapshotDoc(versionId);
-    this.docs.snapshot(row.page_id, userId, "Before restore");
-    this.docs.mutate(row.page_id, userId, (frag) => replaceFragment(frag, getFragment(doc)));
-    doc.destroy();
-    this.releaseIfIdle(row.page_id);
-    return this.store.get(row.page_id);
+    const { row, state: snap } = this.snapshotState(versionId);
+    const pageId = row.page_id as string;
+    this.sync.snapshot(pageId, userId, "Before restore");
+    const desired = fromPM(toPM(snap, pageId, { title: true }), pageId, {
+      isChildPage: (id) => this.store.get(id)?.type === "page" && this.store.get(id)?.parent_id === pageId,
+    });
+    this.sync.edit(userId, ({ state, clock, apply }) => commitDesired(state, clock, desired, (op) => void apply(op)));
+    return this.store.get(pageId);
   }
 
   // ------------------------------------------------------------------ search
 
   search(workspaceId: string, q: string, limit = 20) {
+    this.sync.flush(); // pending index updates first, so results include the latest edits
     const tokens = String(q ?? "")
       .toLowerCase()
       .match(/[\p{L}\p{N}]+/gu);

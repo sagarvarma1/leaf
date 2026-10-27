@@ -6,7 +6,7 @@ import { NodeViewWrapper, ReactNodeViewRenderer, type NodeViewProps } from "@tip
 import type { SuggestionProps } from "@tiptap/suggestion";
 import { forwardRef, useEffect, useState } from "react";
 import { api, ApiError, getShareToken } from "@/lib/api";
-import { useCollab } from "@/lib/collab";
+import { useDoc } from "@/lib/sync";
 import { Icon, Popover } from "../ui";
 import { useEditorContext } from "./context";
 import { getState, isAlive, pageTitle, upsertBlocks, useBlock, useWorkspace } from "@/lib/store";
@@ -173,19 +173,19 @@ function SyncedBlockView({ node, selected }: NodeViewProps) {
   );
 }
 
-/** The synced content: its own Yjs document and provider, edited by a nested editor. */
+/** The synced content: its own document (the container's blocks), edited by a nested editor. */
 function SyncedEditor({ syncId }: { syncId: string }) {
   const ctx = useEditorContext();
-  const collab = useCollab(syncId, getShareToken(), { expose: false });
-  if (!collab?.ready) return <div className="synced-loading" />;
+  const doc = useDoc(ctx.sync, syncId);
+  if (!doc.ready || !ctx.sync.view.getBlock(syncId)) return <div className="synced-loading" />;
   const Inner = ctx.Editor;
   return (
     <Inner
       variant="synced"
       pageId={ctx.pageId}
       workspaceId={ctx.workspaceId}
-      doc={collab.doc}
-      provider={collab.provider}
+      sync={ctx.sync}
+      rootId={syncId}
       user={ctx.user}
       readOnly={ctx.readOnly}
       commentedBlocks={ctx.commentedBlocks}

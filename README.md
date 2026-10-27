@@ -1,8 +1,10 @@
 # Leaf 🌿
 
 **I rebuilt Notion's core to learn how it works.** Leaf is a small, working Notion: every page
-is a tree of blocks stored in SQLite, and pages are edited by several people at once through a
-CRDT over WebSockets. Any block can have children, and columns and synced blocks work.
+is a tree of blocks stored in SQLite, edited by several people at once through **a sync engine
+I wrote from Notion's engineering blog**: block records changed by server-ordered transactions,
+and an RGA text CRDT with Peritext formatting and text slices (see **[docs/SYNC.md](docs/SYNC.md)**).
+Any block can have children, and columns and synced blocks work.
 Databases have relations, rollups, formulas, and four kinds of view. An AI agent edits pages
 as a live collaborator, and any run can be discarded without touching what people wrote in the
 meantime. It deploys as a split stack (Next.js on a serverless host, the realtime server in a
@@ -30,17 +32,20 @@ section says exactly where it stops.
 - **Columns**: drag a block by its ⋮⋮ handle onto the edge of another block to put them side by
   side, or use `/columns`. Drag the gap between columns to resize them. Column lists are
   `column_list > column` blocks, as in Notion's API.
-- **Synced blocks**: `/synced` creates a block whose content is its own CRDT document. Copy and
+- **Synced blocks**: `/synced` creates a block whose content is its own document. Copy and
   paste it anywhere, and every copy is the same live content. Editing it on one page shows on
   every other page, with remote cursors inside it. Search credits every page that shows it.
-- **Real-time collaboration**: one Yjs document per page, synced over a WebSocket server I wrote
-  (the y-websocket wire protocol, with auth, read-only enforcement and persistence added). You get
-  named, colored cursors, avatars of who is on the page, and per-user undo.
-- **Offline mode**: Leaf works on a plane. A service worker serves the app shell, and pages are
-  downloaded to IndexedDB in the background, including ones you've never opened. You can cold-start
-  the app with no network, open any page, edit it, and reload. Edits merge with everyone else's
-  on reconnect, with no conflict dialogs. The UI shows what's saved on this device and how many
-  changes are waiting.
+- **Real-time collaboration on my own sync engine**, after Notion's design: blocks are records,
+  edits are operations in transactions (`saveTransactions`), the server orders structure and
+  broadcasts commits (its MessageStore), and text inside a block is a CRDT (RGA with Notion's
+  ordering rule, Peritext marks, text instances and slices so Enter/Backspace don't lose
+  concurrent typing). You get named, colored cursors, avatars of who is on the page, and undo
+  that only reverts your own edits. No Yjs.
+- **Offline mode**: Leaf works on a plane. A service worker serves the app shell; a RecordCache
+  keeps pages in IndexedDB (downloaded in the background for reasons: favorite, recent,
+  workspace, inherited); and a TransactionQueue keeps your edits, structure included, until the
+  server confirms them. You can cold-start with no network, open any kept page, edit it, reload,
+  and everything merges on reconnect with no conflict dialogs.
 - **Leaf AI**: an agent (Claude Opus 5.5, tool use) that **joins the page as a collaborator**. It
   appears in everyone's presence list with its own cursor, and its text is typed into the shared
   document as it writes. It reads pages, writes and rewrites blocks, searches the workspace,
@@ -94,37 +99,38 @@ Vercel or Orbit, and the API goes in a container on Fly.io, Railway or a VPS.
 ```mermaid
 flowchart LR
   subgraph Browser["Browser (Next.js app)"]
-    ED["TipTap editor<br/>y-prosemirror binding"]
-    YD["Y.Doc per page / synced block<br/>+ IndexedDB replica"]
-    ST["Workspace store<br/>(pages, databases, rows)"]
-    ED <--> YD
+    ED["TipTap editor<br/>+ sync binding (toPM / fromPM)"]
+    RP["Sync client<br/>confirmed records + pending view<br/>TransactionQueue · RecordCache (IndexedDB)"]
+    ST["Workspace store<br/>(sidebar: pages, databases)"]
+    ED <--> RP
   end
   subgraph Server["Leaf server (Node, one process)"]
-    WSD["/ws/doc/:id<br/>Yjs sync + awareness"]
-    WSE["/ws/events<br/>workspace event hub"]
+    TX["saveTransactions<br/>loadPageChunk · syncRecordValues"]
+    WSE["/ws/events<br/>MessageStore: commits, presence"]
     REST["REST API"]
-    DM["DocManager<br/>live Y.Docs, update log,<br/>compaction, projection"]
-    AI["Leaf AI agent<br/>tool loop · presence · per-run undo"]
-    DB[("SQLite (WAL)<br/>blocks · ydocs · yupdates<br/>snapshots · comments · FTS5")]
+    SY["SyncService<br/>check · apply · version · persist"]
+    AI["Leaf AI agent<br/>tool loop · presence · Discard"]
+    DB[("SQLite (WAL)<br/>blocks · text_instances<br/>snapshots · comments · FTS5")]
   end
   CL["Claude API"]
-  YD <-- "binary sync + presence (ticket auth)" --> WSD
+  RP -- "transactions (HTTP)" --> TX
+  RP <-- "commits, presence, subscriptions (ticket auth)" --> WSE
   ST <-- "JSON events" --> WSE
   ST -- "fetch /api (proxied by Next)" --> REST
-  WSD --> DM
-  REST --> DM
+  TX --> SY
+  REST --> SY
   REST --> AI
-  AI -- "Yjs transactions (own origin)" --> DM
+  AI -- "edits from its own session" --> SY
   AI <--> CL
-  DM --> DB
-  REST --> DB
-  DM -- "changed blocks" --> WSE
+  SY --> DB
+  SY -- "commits" --> WSE
 ```
 
 ```
-packages/shared   block types, Y doc <-> blocks, Markdown <-> blocks, database logic + formula language (pure, unit tested)
-apps/server       node:http REST + ws, DocManager, Hub, Leaf AI agent, SQLite schema, seed, sandboxes
-apps/web          Next.js App Router, editor, sidebar, database views, AI panel, comments, history, search
+packages/shared   block types; the sync engine (sync/: text CRDT, records + ops, editor bridge,
+                  commit, replica); Markdown <-> blocks; database logic + formula language
+apps/server       node:http REST + ws, SyncService, Hub (MessageStore), Leaf AI agent, SQLite, seed, sandboxes
+apps/web          Next.js App Router, editor + sync binding, sync client, sidebar, database views, AI panel…
 scripts/          dev runner, e2e (Playwright), reset
 deploy/           Fly.io, docker-compose + Caddy configs (see DEPLOY.md)
 ```
@@ -133,7 +139,8 @@ deploy/           Fly.io, docker-compose + Caddy configs (see DEPLOY.md)
 
 ```sql
 blocks(id, type, workspace_id, parent_id, page_id, properties JSON, content JSON,
-       created_by, created_at, last_edited_by, last_edited_at, archived)
+       created_by, created_at, last_edited_by, last_edited_at, archived, text JSON, version)
+text_instances(id, state JSON)      -- text CRDTs; blocks.text lists slices of them
 ```
 
 | type | properties | parent_id | content |
@@ -146,87 +153,68 @@ blocks(id, type, workspace_id, parent_id, page_id, properties JSON, content JSON
 | `synced_block` | `synced_from`: `null` on the container, the container's id on each instance | creating page (container) / host block (instance) | the container's top-level blocks |
 
 Rich text is Notion-shaped: `[{ text, marks: { bold, italic, … } }, { text: "@Bob", mention: { type: "user", id } }]`.
+It's derived from the block's text slices on every commit, so REST, search, export and the AI
+read plain records.
 
 A few Notion details kept on purpose:
 
-- **List items are blocks; lists are not.** The editor needs `<ul>` containers, so the projection
-  flattens them and hydration regroups them.
+- **List items are blocks; lists are not.** The editor needs `<ul>` containers, so rendering
+  groups list items into lists and reading the editor flattens them again.
 - **Children of any block.** A ProseMirror text block can't contain blocks, so the editor wraps a
   block that has children in a `nest` node: the first child *is* the block (it keeps its id), and
   the rest are its children. This is the same shape list items and toggles already use. The block
   table just sees a paragraph whose `content` holds its children.
 - **A sub-page is a block in its parent's content**, so deleting its link block trashes the page,
-  and undo brings it back.
-- **Synced blocks are documents.** The container block owns a Yjs document, the same way a page
+  and undo brings it back. Its parent stays the page even when it sits inside a column.
+- **Synced blocks are documents.** The container block owns its blocks, the same way a page
   does. Each page that shows it holds a `synced_block` instance pointing at the container. Access
   follows the container's ancestry (the page it was created on), as in Notion, where a synced
   block from a page you can't open shows as unavailable.
 
 ## Sync design
 
-**Page content is a CRDT; structure is server-ordered operations.**
+The full design, with the mapping to Notion's posts and the places Leaf deviates, is in
+**[docs/SYNC.md](docs/SYNC.md)**. In short:
 
-1. **Rich text → Yjs.** Each page (and each synced block container) is a `Y.Doc` holding a
-   `Y.XmlFragment` in the shape y-prosemirror expects, and every block node carries a stable
-   `blockId`. The server applies each update, rebroadcasts it, **appends it to an update log
-   immediately** (crash safety), compacts the log on a 1 s debounce, and **projects** the doc into
-   the `blocks` table on a 300 ms debounce. The projection diffs against stored rows and refreshes
-   the search index.
-2. **Writes from the server side go through the CRDT too.** Sidebar renames, REST block writes,
-   sub-page links, version restores and *every AI edit* run as Yjs transactions on the live doc.
-   Open editors receive them like any collaborator's edit. There's one write path, so the doc and
-   the table can't drift.
-3. **Structure (tree, schema, cells, comments, sharing) → REST + events.** Each operation is
-   applied in a SQLite transaction and published on `/ws/events`. Database cells are independent
-   last-writer-wins registers. A two-way relation write updates the mirror cells on the related
-   rows in the same transaction.
+1. **Records and transactions.** Edits are operations (`create`, `update`, `move`, `delete`,
+   `text`, `split`, `merge`) grouped into transactions. The browser applies them at once, queues
+   them in IndexedDB, and sends them with `saveTransactions`. The server checks each op against
+   the user's access, applies it in one SQLite transaction, bumps record versions, and
+   broadcasts the commit to the clients following those pages.
+2. **Structure is server-ordered; text is a CRDT.** Clients rebase their pending ops on every
+   commit, so structure ends in the server's order. Text inside a block is an RGA (ids
+   `session@clock`, same-origin items newest first, tombstones) with Peritext marks.
+3. **Text instances and slices.** A block's text is slices of text instances, so Enter (split)
+   and Backspace (merge) move ranges instead of copying text, and someone typing in that range at
+   the same time keeps their text in the right block.
+4. **Server-side writes use the same path.** REST writes, renames, page moves, version restores
+   and every AI edit are edits through the sync service, broadcast like anyone's.
 
-**Schema leniency is a CRDT safety rule.** When a merged Yjs tree doesn't fit the ProseMirror
-schema, y-prosemirror deletes the offending element *from the shared document* on every client.
-A strict content rule (say "a column list needs two columns") would turn a harmless concurrent
-leftover into lost text. So layout nodes use loose rules (`nest: block+`, `columnList: column+`),
-the projection tolerates leftovers, and tidying (unwrapping a one-child nest or a one-column
-list) runs only inside the local user's own edits, never in reaction to remote ones. If it did,
-two clients could "fix" the same thing at once and duplicate content.
+**Presence** goes over the same WebSocket, per document: `{ block, item }` anchors a caret to
+a character, so it doesn't drift when others type earlier in the line. Leaf AI publishes
+presence from the server.
 
-**Presence** uses Yjs awareness. The server tracks which awareness ids each socket owns and
-removes them when the socket closes, so stale cursors don't linger. Leaf AI's cursor is a
-server-side awareness state, positioned with Yjs relative positions inside the text it's typing.
-
-**Offline mode.** There are two layers, kept separate on purpose:
-
-- **Content** is the CRDT. The browser keeps each page's Yjs document in IndexedDB. After the
-  workspace loads, `lib/offline.ts` downloads up to 80 pages one at a time in the background:
-  favorites and recent pages first, skipping any whose copy is already newer than their last
-  edit, and following synced blocks into their own documents. On reconnect the y-websocket
-  handshake exchanges state vectors and sends only the missing updates. Offline edits are
-  ordinary CRDT updates, so there's nothing to resolve.
-- **The shell** comes from `public/sw.js`, which is network-first for every same-origin GET and
-  falls back to the last good copy. Online behaviour is unchanged (no stale UI after a deploy).
-  Offline, the HTML, scripts and the read-only API responses the UI needs (session, page tree,
-  page metadata, comments) come from the cache. Offline page switches load the document itself,
-  because Next's client-side navigation needs a server round trip.
-- **Honest scope:** actions that change the structure server-side (creating pages, database cells,
-  comments) are server-ordered. They fail with "You're offline" instead of being queued.
-  Search falls back to matching page titles. Logging out wipes the caches and the local
-  documents.
-
-The editor is created only once the doc has content, so two clients never each insert a default
-paragraph.
+**Offline mode** has two layers. **Content**: the RecordCache and TransactionQueue in
+IndexedDB; pages are kept for reasons, refetched only when edited since, and followed so they
+stay fresh. **Shell**: `public/sw.js` is network-first for same-origin GETs and falls back to
+the last good copy. Everything inside a page works offline, structure included. Database cells,
+comments and creating pages need the server and say so. Logging out wipes the caches.
 
 ### Conflict handling
 
 | Situation | What happens |
 | --- | --- |
-| Two people type in the same paragraph | YATA (Yjs) interleaves deterministically. Both inserts survive, and every replica gets identical bytes. |
-| One person deletes a block another is editing | The delete wins for the block, and the concurrent insert inside it is dropped. Undo restores it. |
-| Splitting a block copies its `blockId` | The client re-keys duplicates immediately, and the server re-keys any it still sees. |
-| Pasting blocks from another page | Projection re-keys ids owned by another page, so a pasted block never steals another page's row. Pasting a *synced block* keeps its container id, which is how a new live copy is made. |
-| Concurrent structural edits leave a one-child nest or a one-column list | Kept as-is (it renders fine), and tidied by the next local edit (see schema leniency above). |
+| Two people type in the same paragraph | Both kept; runs typed at the same spot stay intact, and every replica converges. |
+| Enter in a paragraph while someone types in its tail | Their text ends up in the new block (text slices). |
+| Backspace merges a block someone is typing in | Their text ends up in the merged block. |
+| A block is moved while someone edits it | The edit survives: the text lives in its instance, not the list. |
+| A block is deleted while someone types in it | The delete wins; undo restores it with its text. |
+| Bold + italic at once | Both apply. Bold vs. un-bold: the newer op wins, everywhere. |
+| An op no longer applies (its block was deleted first) | Skipped; the rest of the transaction commits. |
 | Same database cell edited by two users | Last write wins for that cell. Other cells are unaffected. |
-| A person edits while Leaf AI is writing | Both land (it's the same CRDT). **Discard** undoes only the AI's operations, so the person's edits stay. |
-| Undo | `Y.UndoManager` undoes only your own changes, never a collaborator's or the AI's. |
-| Version restore | A *forward* edit that makes the doc equal to the snapshot, so a restore can itself be undone. |
+| A person edits while Leaf AI is writing | Both land. **Discard** reverts only the AI's ops, and keeps a block the AI wrote if a person typed into it. |
+| Undo | Inverse ops of your own transactions; text inverses touch only your own characters. |
+| Version restore | A *forward* edit that makes the page equal to the snapshot, so a restore can itself be undone. |
 
 ## Leaf AI
 
@@ -234,16 +222,16 @@ Leaf AI is a tool-use loop with Claude Opus 5.5, running on the server. Its tool
 `read_page`, `insert_blocks` (Markdown in, real blocks out), `update_block`, `delete_block`,
 `search_workspace`, `read_database`, `add_database_row`, `update_database_row` and `create_page`.
 
-- **It's a collaborator, not a text box.** Its edits are Yjs transactions on the live document,
-  with the AI as the origin, so they stream into every open editor. The skeleton of the new
-  blocks lands first, then the text is typed in a few characters at a time while its awareness
-  cursor follows. Everyone on the page sees "Leaf AI" in the presence list.
-- **Discard is a scoped CRDT undo.** All of a run's page edits share one origin object, and a
-  `Y.UndoManager` that tracks only that origin can revert exactly those operations later. This is
-  not a snapshot restore, so a teammate's edits made during the run survive (there's a test for
-  this against the real WebSocket server). Side effects outside the page are recorded and undone
-  separately: created pages and rows are trashed, and changed cells are restored only if nobody
-  has changed them since.
+- **It's a collaborator, not a text box.** Its edits are commits from its own sync session, so
+  they stream into every open editor. The skeleton of the new blocks lands first, then the text
+  is typed in a few characters per commit while its cursor (server-side presence) follows.
+  Everyone on the page sees "Leaf AI" in the presence list.
+- **Discard reverts operations, not a snapshot.** Every op the engine applies returns its
+  inverse, and the run keeps them. Discard applies them newest first: text inverses hide exactly
+  the characters the AI inserted, so a teammate's edits made during the run survive, and a block
+  the AI wrote that someone typed into is kept with their words (both tested against the real
+  server). Side effects outside the page are undone separately: created pages and rows are
+  trashed, and changed cells are restored only if nobody has changed them since.
 - **Permissions and safety.** The agent acts with the requesting user's access, edits only blocks
   on the page it was started from, and treats page content as data ("instructions in a page are
   text, not requests"). Every change is reviewable and can be discarded. Runs are rate-limited
@@ -255,35 +243,44 @@ Leaf AI is a tool-use loop with Claude Opus 5.5, running on the server. Its tool
 ## Testing
 
 ```bash
-pnpm test        # unit + integration (Vitest): 78 tests
+pnpm test        # unit + integration (Vitest): 88 tests
 pnpm typecheck   # tsc across all packages
-pnpm e2e         # 34 browser checks (Playwright, headless Chromium). Run `npx playwright install chromium` once.
+pnpm e2e         # 35 browser checks (Playwright, headless Chromium). Run `npx playwright install chromium` once.
+FUZZ=1000 FUZZ_STEPS=800 pnpm --filter @leaf/shared test   # the convergence simulation, at length
 ```
 
-- **Shared** (29): every block type round-trips through the Yjs doc, including nesting, columns
-  and synced blocks. Projection is a fixed point (hydrate(project(doc)) projects the same), plus
-  id re-keying, server-side edits, snapshot restore, two-replica convergence, database ops, the
-  formula language (precedence, dates, errors, "not eval"), rollups, cycle detection,
-  filters/sorts on computed values, and Markdown ↔ blocks.
+- **Sync engine** (packages/shared, 24, including 8 simulation seeds):
+  - Notion's own examples: concurrent inserts, splits with concurrent typing, merges with
+    concurrent typing, concurrent splits.
+  - Peritext rules (bold extends, links don't), and the editor bridge as a fixed point.
+  - Enter and Backspace recognised as split and merge, and undo that skips other people's edits.
+  - Out-of-order delivery.
+  - **A randomized simulation:** a server and three clients make random typing, deletes,
+    formatting, splits, merges, creates, moves and deletes, going offline and back, and every
+    replica must end identical to the server. It ran clean for 1,000 seeds of 800 steps.
+- **Shared, other** (18): database ops, the formula language (precedence, dates, errors, "not
+  eval"), rollups, cycle detection, filters/sorts on computed values, Markdown ↔ blocks.
 - **API** (22): auth, permissions, share links, the page tree, trash, REST block writes,
-  databases, two-way relation mirroring, rollups and formulas in export, nesting and columns in
-  the block table, synced blocks across pages (search, access), comments, versions, search.
-- **Convergence** (9): three real `y-websocket` clients make 180 interleaved random edits against
-  the real server and must end byte-identical. Also covers offline merge, projection equals the
-  documents, read-only enforcement, auth, and restart durability.
-- **Leaf AI** (7): edits through the CRDT attributed to the AI; presence and cursor seen by
-  another client mid-run; **discard keeps a concurrent human edit**; cited answers; database edits
-  by property name and their discard; refusing cross-page edits and bad tool input; one run per page.
+  databases, two-way relation mirroring, rollups and formulas in export, nesting and columns,
+  synced blocks across pages (search, access), comments, versions, search.
+- **Sync over the network** (10): clients doing exactly what the browser does (`loadPageChunk`,
+  the WebSocket, `saveTransactions`) against the real server. Live delivery, presence, three
+  clients making random concurrent edits, offline merge, derived text in the block table, REST
+  edits reaching editors, refusals for viewers and outsiders, and restart durability.
+- **Leaf AI** (8): edits attributed to the AI; presence and cursor seen mid-run; **Discard keeps
+  a concurrent human edit**, and a block the AI wrote that a person typed into; cited answers;
+  database edits by property name and their discard; refusing cross-page edits and bad input;
+  one run per page.
 - **Sandboxes and tickets** (6): isolation, invite links, rate limits, a sweep that leaves nothing
-  behind (blocks, docs, users, links), and ticket signing, expiry, tampering and WebSocket auth.
-- **Persistence** (5): crash safety through the update log, compaction, paste re-keying, hydration, autosave.
+  behind, and ticket signing, expiry, tampering and WebSocket auth.
 - **E2E** (35): Alice and Bob in separate browsers through:
   - presence, live and concurrent typing, the slash menu, markdown shortcuts, toolbar, per-user undo;
   - nesting and turn-into-with-children, columns via slash and drag-to-edge, drag reorder, block menu;
   - mentions, offline merge, sidebar operations;
   - **offline mode with the network really cut** (service worker included): cold reload, open a
     never-visited page, edit, reload again, then reconnect and converge with an online editor;
-  - database table, board, filter, sort, relations, rollups, formulas (with live preview), calendar drag and gallery;
+  - database table, board, filter, sort, relations, rollups, formulas (with live preview),
+    calendar drag and gallery;
   - comments, ⌘K search, version restore, share links;
   - **Leaf AI typing live with its cursor and being discarded**, synced block edits across two pages;
   - guest sandboxes with an invite link, and sign-up isolation.
@@ -294,17 +291,21 @@ pnpm e2e         # 34 browser checks (Playwright, headless Chromium). Run `npx p
 
 ## Tradeoffs
 
-- **Yjs instead of OT.** A CRDT makes merges commutative, so offline editing, reconnect and a
-  server-side AI editing alongside people come almost for free. The costs: metadata overhead,
-  less control over intent ("delete wins"), a doc that must be projected to be queryable, and
-  schemas that must stay lenient (above).
-- **Doc as the content source, block table as the projection.** The table is the queryable model
-  (REST, search, export, permissions, AI reads), and it trails the doc by about 300 ms. Every
-  server write goes through the doc, so the two never diverge.
-- **One CRDT doc per page, plus one per synced block.** Synced blocks are the one place content is
-  shared across pages, and giving them their own document keeps "edit once, show everywhere"
-  exact. The cost is a nested editor per instance, and snapshots of a page don't include
-  synced content.
+- **Notion's hybrid instead of one big CRDT.** Leaf first ran on Yjs (one CRDT document per
+  page). It now follows Notion: records + server-ordered transactions for structure, a CRDT only
+  for text. Structure gets intuitive "the server's order wins" semantics, validation and
+  permissions per op, and moves that can't lose concurrent edits. Text keeps character-level
+  merging. The costs: a server round trip orders structure (the client hides it by applying
+  optimistically and rebasing), and I own the engine and its tests.
+- **The block table is the source of truth.** No projection step: the records *are* the model,
+  and derived text (`rich_text`, `title`) is recomputed on each commit for REST, search, export
+  and the AI.
+- **Push records, not version pings.** Notion's MessageStore sends versions and clients fetch
+  stale records. Leaf pushes the committed records in the same message (one fewer round trip per
+  remote keystroke) and still uses versions to keep the newest copy.
+- **Synced blocks are their own documents** (a container block owning blocks), so "edit once,
+  show everywhere" is exact. The cost is a nested editor per instance, and snapshots of a page
+  don't include synced content.
 - **Database cells use LWW, not CRDT.** Cells are small atomic values; server order matches how
   people expect a spreadsheet cell to behave and makes two-way relations a single transaction.
 - **Computed properties are evaluated in the browser** from the workspace store, so rollups
@@ -318,13 +319,14 @@ pnpm e2e         # 34 browser checks (Playwright, headless Chromium). Run `npx p
 
 ## Limitations (honest list)
 
-- **Single server process**: no horizontal scaling. Docs are held in memory while open.
+- **Single server process**: no horizontal scaling. Text instances are cached in memory.
 - **Permissions are coarse**: workspace members can edit everything, and share links grant view
   or edit on a page subtree. There are no per-page ACLs or teamspaces.
 - **Nesting**: children of any *text* block (paragraph, heading, callout, to-do, list item,
   toggle, quote), not of code blocks, images or embeds. Columns live at the top level of a page
-  or synced block. Structural moves (Tab, drag) are delete + insert in the CRDT, so a concurrent
-  text edit inside the moved block can be lost (the usual tree-CRDT tradeoff).
+  or synced block.
+- **Text instances grow**: tombstones are never garbage-collected (Notion's post doesn't cover
+  it either), and a block split many times reads several slices.
 - **Synced blocks**: version history of a page doesn't include synced content, and you can't put
   pages, databases or other synced blocks inside one.
 - **Databases**: filters are AND-only, there's no timeline view, and sort/filter are shared per
@@ -334,8 +336,9 @@ pnpm e2e         # 34 browser checks (Playwright, headless Chromium). Run `npx p
   key: a public deployment should keep the per-user rate limit.
 - **Invites** add existing accounts (or guests via sandbox links). There's no email delivery and
   no password reset.
-- **Offline** covers page content. Creating pages, database edits and comments need a
-  connection, and only pages downloaded beforehand (up to 80 per workspace) open offline.
+- **Offline** covers everything inside a page, structure included. Creating pages, database
+  edits and comments need a connection, and only pages downloaded beforehand (up to 80 per
+  workspace) open offline. Versions saved by the old Yjs engine can't be previewed.
 - **Images take a URL**. There are no uploads.
 - **Mobile** layout is basic, and there's no accessibility audit.
 - Verified on macOS and Linux with Node 22, and in Docker (the production image).
@@ -353,7 +356,8 @@ GET|POST /api/pages/:id/comments   PATCH|DELETE /api/comments/:id
 GET|POST /api/pages/:id/versions   GET /api/versions/:id   POST /api/versions/:id/restore
 GET|PUT /api/pages/:id/share   GET /api/share/:token
 GET /api/ai/status   GET|POST /api/pages/:id/ai   POST /api/ai/runs/:id/stop|keep|discard
-WS  /ws/doc/:id  (Yjs sync + awareness; pages and synced blocks)    WS /ws/events?workspace=  (structure events)
+POST /api/saveTransactions   POST /api/loadPageChunk   POST /api/syncRecordValues        (sync, Notion's names)
+WS   /ws/events?workspace=&session=   (events, commits for followed documents, presence)
 ```
 
 Auth is the `leaf_session` cookie, `Authorization: Bearer <token>` for scripts, or `?ticket=`

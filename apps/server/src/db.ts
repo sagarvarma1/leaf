@@ -59,9 +59,7 @@ CREATE TABLE IF NOT EXISTS favorites (
   PRIMARY KEY (user_id, page_id)
 );
 
--- Collaborative document state. ydocs holds a compacted snapshot; yupdates is an
--- append-only log of increments written as they arrive (crash safety), folded into
--- ydocs on a debounce.
+-- Legacy (Yjs documents, before the Notion-style sync). Kept so old data files open.
 CREATE TABLE IF NOT EXISTS ydocs (
   doc_id TEXT PRIMARY KEY,
   state BLOB NOT NULL,
@@ -75,6 +73,7 @@ CREATE TABLE IF NOT EXISTS yupdates (
 );
 CREATE INDEX IF NOT EXISTS yupdates_doc ON yupdates(doc_id, seq);
 
+-- Version history: JSON of a page's records and text instances at a point in time.
 CREATE TABLE IF NOT EXISTS snapshots (
   id TEXT PRIMARY KEY,
   page_id TEXT NOT NULL,
@@ -119,6 +118,20 @@ function migrate(db: DB) {
   // Guest sandboxes: throwaway users and workspaces that are swept after they expire.
   if (!has("users", "guest")) db.exec("ALTER TABLE users ADD COLUMN guest INTEGER NOT NULL DEFAULT 0");
   if (!has("workspaces", "expires_at")) db.exec("ALTER TABLE workspaces ADD COLUMN expires_at INTEGER");
+  // Notion-style sync: block text lives in text instances (CRDTs), referenced by slices.
+  if (!has("blocks", "text")) db.exec("ALTER TABLE blocks ADD COLUMN text TEXT");
+  if (!has("blocks", "version")) db.exec("ALTER TABLE blocks ADD COLUMN version INTEGER NOT NULL DEFAULT 1");
+  db.exec(`CREATE TABLE IF NOT EXISTS text_instances (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS block_instances (
+    block_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    PRIMARY KEY (block_id, instance_id)
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS block_instances_inst ON block_instances(instance_id)");
   db.exec(`CREATE TABLE IF NOT EXISTS join_links (
     token TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,

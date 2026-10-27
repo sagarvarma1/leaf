@@ -8,6 +8,7 @@ import { setShareToken } from "@/lib/api";
 import { isOnline, recentPages, touchRecent, useOnline, useServiceWorker, warmWorkspace } from "@/lib/offline";
 import { useSession } from "@/lib/session";
 import { childPages, getState, openWorkspace, useWorkspace } from "@/lib/store";
+import { syncFor } from "@/lib/sync";
 
 export default function WorkspaceLayout({ children }: { children: React.ReactNode }) {
   const params = useParams<{ ws: string; slug?: string[] }>();
@@ -32,6 +33,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
       router.replace("/");
       return;
     }
+    // The sync client first: the workspace socket carries its subscriptions and commits.
+    syncFor(session.user.id, ws);
     void openWorkspace(ws);
   }, [session.loaded, session.user, ws]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -54,7 +57,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     if (!loaded || !online) return;
     const t = setTimeout(() => {
       const s = getState();
-      void warmWorkspace(ws, s.blocks, [...(pageId ? [pageId] : []), ...s.favorites, ...recentPages(), ...childPages(s, null).map((b) => b.id)]);
+      if (!session.user) return;
+      void warmWorkspace(syncFor(session.user.id, ws), ws, s.blocks, s.favorites, [...(pageId ? [pageId] : []), ...recentPages()]);
     }, 1500);
     return () => clearTimeout(t);
   }, [loaded, online, ws]); // eslint-disable-line react-hooks/exhaustive-deps

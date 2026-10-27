@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError, setShareToken } from "@/lib/api";
 import { useSession } from "@/lib/session";
 import { openShared } from "@/lib/store";
+import { syncFor } from "@/lib/sync";
 import { PageView } from "./PageView";
 
 /** A page opened through a share link: no sidebar, access limited to the shared subtree. */
@@ -23,6 +24,7 @@ export function SharedPage({ token, pageId }: { token: string; pageId: string | 
           router.replace(`/w/${r.workspaceId}/${pageId ?? r.pageId}`);
           return;
         }
+        syncFor(session.user?.id ?? null, r.workspaceId);
         openShared(r.workspaceId, token, []);
         setInfo(r);
       })

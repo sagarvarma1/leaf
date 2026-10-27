@@ -61,9 +61,10 @@ export function seedDemoContent(leaf: Leaf, ws: string, A: string, B: string) {
       todo("Click ✨ AI in the top bar and ask Leaf AI to summarize this page"),
       todo("Press Cmd/Ctrl+K to search"),
       { type: "toggle", properties: { rich_text: [t("How does sync work?")], open: false }, children: [
-        p("Each page is a Yjs document. The server merges updates, stores them in SQLite, and projects the document into the block table."),
-        bullet("Text: a CRDT, so concurrent edits always converge"),
-        bullet("Databases and the page tree: small server-ordered operations"),
+        p("Like Notion: blocks are records, and every edit is a transaction of operations. Your browser applies it at once, queues it, and the server orders it and sends it to everyone else."),
+        bullet("Text inside a block: a CRDT (RGA + Peritext), so concurrent typing always converges"),
+        bullet("Structure (moving, nesting, deleting blocks): ordered by the server"),
+        bullet("Enter and Backspace move slices of shared text, so nobody's typing gets lost"),
       ] },
       { type: "quote", properties: { rich_text: [t("The best way to understand a tool is to rebuild it.")] } },
       { type: "divider" },
@@ -253,9 +254,9 @@ export function seedDemoContent(leaf: Leaf, ws: string, A: string, B: string) {
       p("Everything is a block with an id, a type, properties, a parent pointer and an ordered list of children."),
       { type: "code", properties: { language: "typescript", rich_text: [t(`interface Block {\n  id: string;\n  type: BlockType;\n  properties: Record<string, unknown>;\n  parent_id: string | null;\n  content: string[]; // ordered child ids\n}`)] } },
       h(2, "Sync"),
-      bullet("Clients hold a Yjs replica per page", [bullet("Offline edits merge on reconnect")]),
-      bullet("The server persists an update log and compacts it"),
-      { type: "callout", properties: { icon: "⚠️", rich_text: [t("Databases use server-ordered operations, not the CRDT.")] } },
+      bullet("Clients keep a record cache and a transaction queue", [bullet("Offline edits merge on reconnect")]),
+      bullet("The server orders transactions, bumps record versions and broadcasts commits"),
+      { type: "callout", properties: { icon: "⚠️", rich_text: [t("Only text is a CRDT. Structure and databases use server-ordered operations.")] } },
     ],
   });
   leaf.createPage({
@@ -283,6 +284,6 @@ export function seedDemoContent(leaf: Leaf, ws: string, A: string, B: string) {
   const quote = blocks.find((b) => b.type === "quote");
   const thread = leaf.addComment(welcome.id, B, { blockId: quote?.id ?? null, body: "Love this line. Should we put it on the landing page?" }) as any;
   leaf.addComment(welcome.id, A, { threadId: thread.id, body: "Yes! Adding it to the launch checklist." });
-  leaf.docs.snapshot(welcome.id, A, "Initial version");
-  leaf.docs.flushAll();
+  leaf.sync.snapshot(welcome.id, A, "Initial version");
+  leaf.sync.flush();
 }

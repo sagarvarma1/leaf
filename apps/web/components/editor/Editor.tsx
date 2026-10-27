@@ -1,8 +1,6 @@
 "use client";
 import type { Editor as TEditor } from "@tiptap/core";
 import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
-import Collaboration from "@tiptap/extension-collaboration";
-import CollaborationCursor from "@tiptap/extension-collaboration-cursor";
 import Color from "@tiptap/extension-color";
 import Image from "@tiptap/extension-image";
 import Link from "@tiptap/extension-link";
@@ -20,8 +18,7 @@ import { BubbleMenu, EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { common, createLowlight } from "lowlight";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { WebsocketProvider } from "y-websocket";
-import type * as Y from "yjs";
+import type { SyncClient } from "@/lib/sync";
 import { COLORS, Icon, Popover } from "../ui";
 import { BLOCK_ITEMS, runBlockCommand, SlashCommand, TURN_INTO, type BlockKind, type CommandContext } from "./commands";
 import { EditorContext } from "./context";
@@ -44,16 +41,18 @@ import {
   Toggle,
 } from "./extensions";
 import { copySyncedBlock, DatabaseNode, LeafMention, PageLink, SyncedBlock } from "./nodes";
+import { LeafSync, renderDoc } from "./sync-binding";
 
 const lowlight = createLowlight(common);
 
 export interface EditorProps {
-  /** "synced": the nested editor of a synced block (its own doc, no title). */
+  /** "synced": the nested editor of a synced block (its own document, no title). */
   variant?: "page" | "synced";
   pageId: string;
   workspaceId: string;
-  doc: Y.Doc;
-  provider: WebsocketProvider;
+  /** The sync client, and the document this editor shows (the page, or a synced container). */
+  sync: SyncClient;
+  rootId: string;
   user: { name: string; color: string };
   readOnly: boolean;
   commentedBlocks: Set<string>;
@@ -87,8 +86,10 @@ function afterTitleExtension(slot: HTMLElement) {
 }
 
 export function Editor(props: EditorProps) {
-  const { doc, provider, user, readOnly } = props;
+  const { sync, rootId, user, readOnly } = props;
   const synced = props.variant === "synced";
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
   const ctxRef = useRef<CommandContext>({ pageId: props.pageId, workspaceId: props.workspaceId, synced });
   ctxRef.current = { pageId: props.pageId, workspaceId: props.workspaceId, synced };
   const slot = useMemo(() => {
@@ -102,11 +103,12 @@ export function Editor(props: EditorProps) {
     {
       immediatelyRender: false,
       editable: !readOnly,
+      content: renderDoc(sync, rootId, !synced),
       extensions: [
         ...(synced ? [SyncedDocument] : [LeafDocument, Title]),
         StarterKit.configure({
           document: false,
-          history: false, // Yjs undo manager instead: undo only your own changes
+          history: false, // the sync client's undo instead: undo only your own changes
           codeBlock: false,
           heading: { levels: [1, 2, 3] },
           dropcursor: { color: "#2383e2", width: 3 },
@@ -145,8 +147,7 @@ export function Editor(props: EditorProps) {
             return "";
           },
         } as any),
-        Collaboration.configure({ document: doc, field: "default" }),
-        CollaborationCursor.configure({ provider, user }),
+        LeafSync({ sync, rootId, title: !synced, readOnly: () => readOnlyRef.current }),
       ],
       editorProps: {
         attributes: synced
@@ -167,7 +168,7 @@ export function Editor(props: EditorProps) {
         },
       },
     },
-    [doc, provider],
+    [sync, rootId],
   );
 
   useEffect(() => {
@@ -183,22 +184,18 @@ export function Editor(props: EditorProps) {
     editor.view.dispatch(editor.state.tr.setMeta(commentKey, props.commentedBlocks));
   }, [editor, props.commentedBlocks]);
 
-  // Presence identity can change (e.g. name loaded after connect).
-  useEffect(() => {
-    editor?.commands.updateUser?.(user);
-  }, [editor, user.name, user.color]); // eslint-disable-line react-hooks/exhaustive-deps
-
   const context = useMemo(
     () => ({
       pageId: props.pageId,
       workspaceId: props.workspaceId,
+      sync,
       user,
       readOnly,
       commentedBlocks: props.commentedBlocks,
       onComment: props.onComment,
       Editor,
     }),
-    [props.pageId, props.workspaceId, user, readOnly, props.commentedBlocks, props.onComment],
+    [props.pageId, props.workspaceId, sync, user, readOnly, props.commentedBlocks, props.onComment],
   );
 
   if (!editor) return <div className="editor-loading" />;

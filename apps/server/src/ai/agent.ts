@@ -1,41 +1,47 @@
 /**
  * Leaf AI: an agent that edits pages as a live collaborator.
  *
- * A run is a tool-use loop with the model. Its edits to the page are ordinary Yjs
- * transactions, so every open editor sees them arrive like a teammate's typing, and the
- * agent has its own presence (name, color, cursor) through the page's awareness.
+ * A run is a tool-use loop with the model. Its edits are ordinary sync commits from its
+ * own session, so every open editor sees them arrive like a teammate's typing (a few
+ * characters per commit), and the agent publishes presence with a cursor that follows
+ * what it types.
  *
- * Every page edit in a run carries one origin object. A Y.UndoManager tracking only that
- * origin can later revert exactly the run's changes ("Discard"), even after people kept
- * typing around them: the CRDT undoes the AI's operations, not a snapshot of the page.
- * Side effects outside the page (new pages, database rows and cells) are recorded and
- * reverted separately.
+ * Every op the engine applies returns its inverse; the run keeps them. "Discard" applies
+ * them newest first. The text inverses hide exactly the characters the AI inserted (and
+ * restore what it deleted), so people's edits made during the run stay: it undoes the
+ * AI's operations, not a snapshot of the page. Side effects outside the page (new pages,
+ * database rows and cells) are recorded and reverted separately.
  */
 import {
-  appendBlocks,
-  buildSequence,
+  Clock,
   COMPUTED_TYPES,
   computedCell,
-  deleteBlock,
+  createBlocks,
+  deleteOps,
   displayValue,
-  getFragment,
+  fromRichText,
   inlineMarkdown,
+  insertOps,
   markdownToBlocks,
-  marksToAttributes,
+  markOps,
   newId,
+  parseId,
+  makeId,
   plainText,
   randomOptionColor,
+  readText,
   relatedRows,
   richTextToMarkdown,
+  stampInverse,
   type Block,
   type BlockInput,
   type DatabaseProperties,
   type PropertyDef,
+  type RecordOp,
   type RichText,
 } from "@leaf/shared";
-import * as Y from "yjs";
 import type { Leaf, User } from "../app.js";
-import type { LiveDoc, Origin } from "../docs.js";
+import type { EditContext } from "../sync.js";
 import { HttpError } from "../store.js";
 import type { AiModel, MessageParam, Tool } from "./model.js";
 
@@ -65,9 +71,11 @@ interface Run {
   summary: RunSummary;
   workspaceId: string;
   blockId: string | null;
-  origin: Origin & { aiRun: string };
-  live: LiveDoc | null;
-  undo: Y.UndoManager | null;
+  /** The run's sync session and clock: its edits are stamped as its own. */
+  session: string;
+  clock: Clock;
+  /** Inverse ops of every edit, in the order the edits happened. */
+  undo: RecordOp[][] | null;
   createdPages: string[];
   createdRows: string[];
   cellChanges: Array<{ rowId: string; propId: string; before: unknown; after: unknown }>;
@@ -163,29 +171,6 @@ const str = (v: unknown, name: string): string => {
 };
 const optStr = (v: unknown, name: string): string | undefined => (v === undefined || v === null ? undefined : str(v, name));
 
-/** Where a block's own text lives: list items, toggles and quotes keep it in a first paragraph. */
-function textHost(el: Y.XmlElement): Y.XmlElement {
-  if (["listItem", "taskItem", "toggle", "blockquote"].includes(el.nodeName)) {
-    const first = el.toArray().find((c): c is Y.XmlElement => c instanceof Y.XmlElement);
-    if (first) return first;
-  }
-  return el;
-}
-
-function findElement(frag: Y.XmlFragment, id: string): Y.XmlElement | null {
-  let found: Y.XmlElement | null = null;
-  const walk = (p: Y.XmlFragment | Y.XmlElement) => {
-    for (const c of p.toArray()) {
-      if (found) return;
-      if (!(c instanceof Y.XmlElement)) continue;
-      if (c.getAttribute("blockId") === id) found = c;
-      else walk(c);
-    }
-  };
-  walk(frag);
-  return found;
-}
-
 export class AiAgent {
   private runs = new Map<string, Run>();
   private activeByPage = new Map<string, string>();
@@ -246,9 +231,9 @@ export class AiAgent {
       },
       workspaceId: page.workspace_id,
       blockId: blockId ?? null,
-      origin: { server: true, userId: AI_USER.id, aiRun: id },
-      live: null,
-      undo: null,
+      session: `ai-${id.slice(0, 8)}`,
+      clock: new Clock(`ai-${id.slice(0, 8)}`),
+      undo: [],
       createdPages: [],
       createdRows: [],
       cellChanges: [],
@@ -284,7 +269,19 @@ export class AiAgent {
   discard(runId: string, userId: string) {
     const run = this.get(runId);
     if (!run.summary.reviewable) throw new HttpError(400, run.summary.status === "running" ? "Stop the run first" : "This run can no longer be discarded");
-    while (run.undo && run.undo.undoStack.length) run.undo.undo();
+    if (run.undo?.length) {
+      const steps = run.undo;
+      this.leaf.sync.edit(userId, ({ state, apply }) => {
+        for (const inverse of [...steps].reverse()) {
+          for (const op of stampInverse(state, run.clock, inverse)) {
+            // A block the AI created that someone has typed into since stays: its own
+            // text is hidden by the text inverses, the person's words remain.
+            if (op.op === "delete" && this.othersTyped(state, op.id, run.session)) continue;
+            apply(op);
+          }
+        }
+      }, { session: run.session, clock: run.clock });
+    }
     for (const rowId of run.createdRows) if (this.leaf.store.get(rowId)) this.leaf.trashPage(rowId, userId);
     for (const pageId of run.createdPages) if (this.leaf.store.get(pageId)) this.leaf.trashPage(pageId, userId);
     for (const c of [...run.cellChanges].reverse()) {
@@ -298,6 +295,13 @@ export class AiAgent {
     return run.summary;
   }
 
+  /** Does a block show text typed by anyone other than `session`? */
+  private othersTyped(state: EditContext["state"], blockId: string, session: string): boolean {
+    const b = state.getBlock(blockId);
+    if (!b?.text) return false;
+    return readText(state, b).ids.some((id) => parseId(id).s !== session);
+  }
+
   close() {
     for (const run of this.runs.values()) {
       run.stopped = true;
@@ -309,9 +313,6 @@ export class AiAgent {
 
   private async execute(run: Run) {
     const { pageId } = run.summary;
-    const live = this.leaf.docs.hold(pageId);
-    run.live = live;
-    run.undo = new Y.UndoManager(getFragment(live.doc), { trackedOrigins: new Set([run.origin]), captureTimeout: 60 * 60_000 });
     this.showPresence(run, null);
     this.publish(run);
     try {
@@ -358,10 +359,9 @@ export class AiAgent {
       this.hidePresence(run);
       this.activeByPage.delete(pageId);
       run.summary.finishedAt = Date.now();
-      this.leaf.docs.project(pageId);
       const changed = run.summary.edits > 0 || run.createdPages.length > 0 || run.createdRows.length > 0 || run.cellChanges.length > 0;
       if (changed) {
-        // Keep the doc (and the undo history bound to it) until the user decides.
+        // Keep the undo history until the user decides.
         run.summary.reviewable = true;
         run.reviewTimer = setTimeout(() => this.keep(run.summary.id), REVIEW_MS);
       } else this.endReview(run);
@@ -373,10 +373,7 @@ export class AiAgent {
     run.summary.reviewable = false;
     if (run.reviewTimer) clearTimeout(run.reviewTimer);
     run.reviewTimer = null;
-    run.undo?.destroy();
     run.undo = null;
-    if (run.live) this.leaf.docs.release(run.summary.pageId);
-    run.live = null;
     this.publish(run);
   }
 
@@ -407,89 +404,84 @@ export class AiAgent {
 
   // ---------------------------------------------------------------- presence
 
-  private showPresence(run: Run, at: { text: Y.XmlText; index: number } | null) {
-    const live = run.live;
-    if (!live) return;
-    const state: Record<string, unknown> = { user: { name: AI_USER.name, color: AI_USER.color, id: AI_USER.id } };
-    if (at) {
-      const pos = Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(at.text, at.index));
-      state.cursor = { anchor: pos, head: pos };
-    }
-    live.awareness.setLocalState(state);
+  /** The AI's cursor: right after item `item` of block `block` (or just present). */
+  private showPresence(run: Run, at: { block: string; item: string | null } | null) {
+    this.leaf.hub.setServerPresence(run.workspaceId, run.summary.pageId, run.session, AI_USER, at ?? null);
   }
 
   private hidePresence(run: Run) {
-    run.live?.awareness.setLocalState(null);
+    this.leaf.hub.setServerPresence(run.workspaceId, run.summary.pageId, run.session, AI_USER, undefined);
   }
 
-  // ---------------------------------------------------------------- typing
+  // ---------------------------------------------------------------- editing
 
-  private transact(run: Run, fn: () => void) {
-    run.live!.doc.transact(fn, run.origin);
+  /** One commit from the run's session; its inverse joins the run's undo history. */
+  private edit(run: Run, fn: (ctx: EditContext) => void) {
+    const res = this.leaf.sync.edit(AI_USER.id, fn, { session: run.session, clock: run.clock });
+    if (res.ops.length) run.undo?.push(res.inverse);
+    return res;
   }
 
-  /** Type rich text into a block, a few characters per transaction, with the AI's cursor following. */
-  private async typeInto(run: Run, el: Y.XmlElement, runs: RichText, code = false) {
-    const host = textHost(el);
-    const total = runs.reduce((n, r) => n + r.text.length, 0);
-    const chunk = Math.max(3, Math.ceil(total / 200));
-    for (const r of runs) {
+  /** Type rich text at the end of a block, a few characters per commit, with the AI's cursor following. */
+  private async typeInto(run: Run, blockId: string, runs: RichText, code = false) {
+    const { units, marks } = fromRichText(code ? [{ text: plainText(runs) }] : runs);
+    const chunk = Math.max(3, Math.ceil(units.length / 200));
+    for (let i = 0; i < units.length; i += chunk) {
       if (run.stopped) return;
-      if (r.mention) {
-        this.transact(run, () => {
-          const m = new Y.XmlElement("mention");
-          m.setAttribute("kind", r.mention!.type);
-          m.setAttribute("id", r.mention!.id);
-          m.setAttribute("label", r.mention!.type === "user" ? r.text.replace(/^@/, "") : r.text);
-          host.insert(host.length, [m]);
-        });
-        continue;
-      }
-      const attrs = code ? {} : (marksToAttributes(r.marks) ?? {});
-      for (let i = 0; i < r.text.length; i += chunk) {
-        if (run.stopped) return;
-        let text!: Y.XmlText;
-        this.transact(run, () => {
-          const last = host.length ? host.get(host.length - 1) : null;
-          if (last instanceof Y.XmlText) text = last;
-          else {
-            text = new Y.XmlText();
-            host.insert(host.length, [text]);
+      let last: string | null = null;
+      this.edit(run, ({ state, clock, apply }) => {
+        const b = state.getBlock(blockId);
+        if (!b || b.archived || !b.text) return;
+        const at = readText(state, b).units.length;
+        const piece = units.slice(i, i + chunk);
+        const op = insertOps(state, clock, b, at, piece);
+        if (!op || op.op !== "text" || op.ops[0]!.t !== "ins") return;
+        apply(op);
+        const { s, c } = parseId(op.ops[0]!.id);
+        last = makeId(s, c + piece.length - 1);
+        // Formatting of this piece, one mark at a time.
+        const names = new Set(marks.slice(i, i + chunk).flatMap((m) => Object.keys(m)));
+        for (const name of names) {
+          let j = 0;
+          while (j < piece.length) {
+            const v = marks[i + j]?.[name];
+            if (!v) {
+              j++;
+              continue;
+            }
+            let k = j + 1;
+            while (k < piece.length && marks[i + k]?.[name] === v) k++;
+            for (const m of markOps(state, clock, state.getBlock(blockId)!, at + j, at + k, name, v)) apply(m);
+            j = k;
           }
-          text.insert(text.length, r.text.slice(i, i + chunk), attrs);
-        });
-        this.showPresence(run, { text, index: text.length });
-        if (this.opts.typingDelayMs) await sleep(this.opts.typingDelayMs);
-      }
+        }
+      });
+      if (last) this.showPresence(run, { block: blockId, item: last });
+      if (this.opts.typingDelayMs) await sleep(this.opts.typingDelayMs);
     }
   }
 
   /** Insert blocks: the structure lands at once, then the text is typed in, block by block. */
   private async insertBlocks(run: Run, blocks: BlockInput[], where: { after?: string; position?: string }): Promise<string[]> {
+    const { pageId } = run.summary;
     const plan: Array<{ id: string; runs: RichText; code: boolean }> = [];
     const strip = (bs: BlockInput[]): BlockInput[] =>
       bs.map((b) => {
         const id = newId();
         const rt: RichText = b.properties?.rich_text ?? [];
         if (rt.length) plan.push({ id, runs: rt, code: b.type === "code" });
-        return { ...b, id, properties: { ...b.properties, rich_text: [] }, children: b.children && strip(b.children) };
+        const { rich_text: _drop, ...props } = b.properties ?? {};
+        return { ...b, id, properties: props, children: b.children && strip(b.children) };
       });
     const skeleton = strip(blocks);
-    const frag = getFragment(run.live!.doc);
-    if (where.after && !findElement(frag, where.after)) throw new ToolError(`No block ${where.after} on this page`);
-    this.transact(run, () => {
-      if (where.after) appendBlocks(frag, skeleton, where.after);
-      else if (where.position === "start") {
-        const first = frag.get(0);
-        frag.insert(first instanceof Y.XmlElement && first.nodeName === "title" ? 1 : 0, buildSequence(skeleton));
-      } else appendBlocks(frag, skeleton);
-    });
-    run.summary.edits++;
-    for (const p of plan) {
-      const el = findElement(frag, p.id);
-      if (el) await this.typeInto(run, el, p.runs, p.code);
+    if (where.after) {
+      const anchor = this.leaf.store.get(where.after);
+      if (!anchor || anchor.archived || anchor.page_id !== pageId) throw new ToolError(`No block ${where.after} on this page`);
     }
-    this.leaf.docs.project(run.summary.pageId);
+    const at = where.after ? this.leaf.insertionPoint(pageId, where.after) : where.position === "start" ? { parent: pageId, after: null } : this.leaf.insertionPoint(pageId, null);
+    this.edit(run, ({ state, clock, apply }) => createBlocks(state, clock, at.parent, at.after, skeleton, (op) => void apply(op)));
+    run.summary.edits++;
+    for (const p of plan) await this.typeInto(run, p.id, p.runs, p.code);
     return skeleton.map((b) => b.id!);
   }
 
@@ -516,26 +508,23 @@ export class AiAgent {
       case "update_block": {
         const id = str(input.block_id, "block_id");
         const block = this.requireOwnBlock(run, id);
-        const el = findElement(getFragment(run.live!.doc), id);
-        if (!el) throw new ToolError(`No block ${id} on this page`);
+        if (!block.text) throw new ToolError("That block has no text");
         this.step(run, "Rewriting a block");
-        const host = textHost(el);
-        this.transact(run, () => host.length && host.delete(0, host.length));
+        this.edit(run, ({ state, clock, apply }) => {
+          const b = state.getBlock(id)!;
+          for (const op of deleteOps(state, clock, b, 0, readText(state, b).units.length)) apply(op);
+        });
         run.summary.edits++;
         const code = block.type === "code";
-        await this.typeInto(run, el, code ? [{ text: str(input.markdown, "markdown") }] : inlineMarkdown(str(input.markdown, "markdown")), code);
-        this.leaf.docs.project(pageId);
+        await this.typeInto(run, id, code ? [{ text: str(input.markdown, "markdown") }] : inlineMarkdown(str(input.markdown, "markdown")), code);
         return "Updated.";
       }
       case "delete_block": {
         const id = str(input.block_id, "block_id");
         this.requireOwnBlock(run, id);
         this.step(run, "Deleting a block");
-        let ok = false;
-        this.transact(run, () => (ok = deleteBlock(getFragment(run.live!.doc), id)));
-        if (!ok) throw new ToolError(`No block ${id} on this page`);
+        this.edit(run, ({ apply }) => void apply({ op: "delete", id }));
         run.summary.edits++;
-        this.leaf.docs.project(pageId);
         return "Deleted.";
       }
       case "search_workspace": {
@@ -614,9 +603,8 @@ export class AiAgent {
 
   /** Content edits are limited to the page the run was started on. */
   private requireOwnBlock(run: Run, id: string): Block {
-    this.leaf.docs.project(run.summary.pageId);
     const b = this.leaf.store.get(id);
-    if (!b || b.page_id !== run.summary.pageId) throw new ToolError("You can only edit blocks on the current page");
+    if (!b || b.archived || b.page_id !== run.summary.pageId) throw new ToolError("You can only edit blocks on the current page");
     return b;
   }
 

@@ -1,12 +1,13 @@
 "use client";
 /**
  * Client cache of the workspace structure: every page, database and row block (no
- * content blocks; those live in each page's Yjs document). Kept fresh by the server's
+ * content blocks; those load into the sync client per page). Kept fresh by the server's
  * event stream, so the sidebar, breadcrumbs, page links and databases update live.
  */
 import type { Block } from "@leaf/shared";
 import { useRef, useSyncExternalStore } from "react";
 import { api, wsBase, wsTicket } from "./api";
+import { currentSync } from "./sync";
 
 export interface User {
   id: string;
@@ -85,10 +86,9 @@ export function upsertBlocks(blocks: Block[]) {
   const next = { ...state.blocks };
   for (const b of blocks) {
     const cur = next[b.id];
-    // Ignore stale echoes: keep whichever version was edited last.
-    if (cur && cur.last_edited_at > b.last_edited_at && JSON.stringify(cur.properties) !== JSON.stringify(b.properties)) {
-      next[b.id] = { ...b, properties: cur.properties };
-    } else next[b.id] = b;
+    // Updates can arrive out of order: keep the newest version of each record.
+    if (cur && (cur.version ?? 0) > (b.version ?? 0)) continue;
+    next[b.id] = b;
   }
   set({ blocks: next });
 }
@@ -121,6 +121,11 @@ export const setFavorites = (favorites: string[]) => set({ favorites });
 
 let socket: WebSocket | null = null;
 let resume: (() => void) | null = null;
+
+// Going offline: close the socket on purpose. A socket that survives a network change can
+// be silently dead; closing it means coming back online always opens a fresh one (and
+// catches up), instead of trusting one that may never deliver again.
+if (typeof window !== "undefined") window.addEventListener("offline", () => socket?.close());
 let retry: ReturnType<typeof setTimeout> | null = null;
 let retryDelay = 500;
 
@@ -136,6 +141,8 @@ async function connectEvents(workspaceId: string, share?: string | null) {
   }
   const qs = new URLSearchParams({ workspace: workspaceId });
   if (share) qs.set("share", share);
+  const sync = currentSync();
+  if (sync) qs.set("session", sync.session);
   const ticket = share ? null : await wsTicket();
   if (ticket) qs.set("ticket", ticket);
   if (state.workspaceId !== workspaceId) return; // switched away while fetching the ticket
@@ -149,6 +156,10 @@ async function connectEvents(workspaceId: string, share?: string | null) {
     const e = JSON.parse(msg.data);
     if (e.type === "hello") {
       if (!share) void refreshTree(); // catch up on anything missed while disconnected
+      // The sync client follows its documents over this socket and catches up on them.
+      sync?.attach((m) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(m)));
+    } else if (e.type === "commit" || e.type === "presence") {
+      sync?.handleEvent(e);
     } else if (e.type === "blocks") {
       upsertBlocks(e.blocks);
       if (!share && e.blocks.some((b: Block) => b.type === "page" && !b.parent_id && !state.root.includes(b.id))) void refreshTree();
@@ -159,6 +170,7 @@ async function connectEvents(workspaceId: string, share?: string | null) {
   ws.onclose = () => {
     set({ connected: false });
     if (socket !== ws) return;
+    sync?.attach(null);
     socket = null;
     retry = setTimeout(() => void connectEvents(workspaceId, share), retryDelay);
     retryDelay = Math.min(retryDelay * 2, 8000);

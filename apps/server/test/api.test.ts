@@ -144,11 +144,14 @@ describe("pages are blocks", () => {
   it("removing a sub-page block from the document trashes the page; undo restores it", async () => {
     const parent = (await s.api(alice.token, "POST", "/api/pages", { workspaceId: ws, title: "Doc parent" })).body.page;
     const child = (await s.api(alice.token, "POST", "/api/pages", { parentId: parent.id, title: "Doc child" })).body.page;
-    const { removePageLinks, appendBlocks } = await import("@leaf/shared");
-    s.leaf.docs.mutate(parent.id, alice.user.id, (f) => removePageLinks(f, child.id));
+    // An editor removes the sub-page's link from the document: a delete op on the page block.
+    const undo = s.leaf.sync.edit(alice.user.id, ({ apply }) => void apply({ op: "delete", id: child.id })).inverse;
     expect(s.leaf.store.get(child.id)!.archived).toBe(true);
-    s.leaf.docs.mutate(parent.id, alice.user.id, (f) => appendBlocks(f, [{ id: child.id, type: "child_page" }]));
+    expect(s.leaf.store.get(parent.id)!.content).not.toContain(child.id);
+    // Undo (the inverse op) restores it in place.
+    s.leaf.sync.edit(alice.user.id, ({ apply }) => undo.forEach((op) => apply(op)));
     expect(s.leaf.store.get(child.id)!.archived).toBe(false);
+    expect(s.leaf.store.get(parent.id)!.content).toContain(child.id);
   });
 
   it("favorites are per user", async () => {
@@ -161,7 +164,7 @@ describe("pages are blocks", () => {
 });
 
 describe("content blocks over REST", () => {
-  it("appends, updates and deletes blocks; the projection reflects each write", async () => {
+  it("appends, updates and deletes blocks; the records reflect each write", async () => {
     const page = (await s.api(alice.token, "POST", "/api/pages", { workspaceId: ws, title: "API page" })).body.page;
     const r = await s.api(alice.token, "POST", `/api/blocks/${page.id}/children`, {
       children: [

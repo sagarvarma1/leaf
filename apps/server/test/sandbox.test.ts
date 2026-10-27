@@ -70,10 +70,9 @@ describe("WebSocket tickets", () => {
   it("authenticate a WebSocket without the cookie", async () => {
     const alice = await s.login("alice@leaf.dev");
     const { ticket } = (await s.api(alice.token, "GET", "/api/auth/ws-ticket")).body;
-    const page = (await s.api(alice.token, "GET", `/api/workspaces/${alice.workspaces[0].id}/pages`)).body.blocks.find((b: any) => b.type === "page");
     const open = (q: string) =>
       new Promise<number | "open">((resolve) => {
-        const ws = new WebSocket(`${s.wsUrl}/ws/doc/${page.id}?${q}`);
+        const ws = new WebSocket(`${s.wsUrl}/ws/events?workspace=${alice.workspaces[0].id}&${q}`);
         ws.on("open", () => (ws.close(), resolve("open")));
         ws.on("unexpected-response", (_req, res) => resolve(res.statusCode ?? 0));
       });

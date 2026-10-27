@@ -1,43 +1,58 @@
 /**
- * Multi-client convergence over the real WebSocket server.
- *
- * Several y-websocket clients (the same provider the browser uses) connect to one page,
- * make interleaved concurrent edits (text inserts/deletes at random positions, new
- * blocks, formatting, structural deletes), one goes offline and keeps editing, then
- * reconnects. We assert every replica ends byte-for-byte identical, that the server's
- * block-table projection matches the clients' documents, and that the state survives a
- * server restart.
+ * Multi-client sync over the real server: clients load a page (loadPageChunk), follow it
+ * over the WebSocket, and send transactions (saveTransactions), exactly like the browser.
+ * They make interleaved concurrent edits (typing, deletes, formatting, Enter / Backspace,
+ * new blocks, moves, deletes), one goes offline and keeps editing, then reconnects. Every
+ * replica must end identical to the server, and the state must survive a restart.
  */
-import { getFragment, newId, projectFragment } from "@leaf/shared";
+import { deleteOps, insertOps, markOps, readText, type MemoryState } from "@leaf/shared";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { WebsocketProvider } from "y-websocket";
-import * as Y from "yjs";
 import { Leaf } from "../src/app.js";
-import { startServer, sleep, waitFor, type TestServer } from "./helpers.js";
+import { NetClient } from "./client.js";
+import { startServer, waitFor, type TestServer } from "./helpers.js";
 
 let s: TestServer;
 let alice: any;
 let bob: any;
+let ws: string;
 let pageId: string;
-const providers: WebsocketProvider[] = [];
+const clients: NetClient[] = [];
 
-function client(token: string, name: string, extra: Record<string, string> = {}) {
-  const doc = new Y.Doc();
-  const provider = new WebsocketProvider(`${s.wsUrl}/ws/doc`, pageId, doc, {
-    WebSocketPolyfill: WebSocket as any,
-    params: { token, ...extra },
-    disableBc: true,
+beforeAll(async () => {
+  s = await startServer();
+  alice = await s.login("alice@leaf.dev");
+  bob = await s.login("bob@leaf.dev");
+  ws = alice.workspaces[0].id;
+  const page = await s.api(alice.token, "POST", "/api/pages", {
+    workspaceId: ws,
+    title: "Sync test",
+    content: [
+      { type: "paragraph", properties: { rich_text: [{ text: "First paragraph" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "Second paragraph" }] } },
+      { type: "to_do", properties: { rich_text: [{ text: "A task" }] } },
+    ],
   });
-  provider.awareness.setLocalStateField("user", { name, color: "#e16259" });
-  providers.push(provider);
-  return { doc, provider, frag: getFragment(doc) };
+  pageId = page.body.page.id;
+});
+afterAll(async () => {
+  for (const c of clients) c.close();
+  await s.close();
+});
+
+async function client(who: any) {
+  const c = await new NetClient(s, who.token, ws, pageId, who.user.id).open();
+  clients.push(c);
+  return c;
 }
-type Client = ReturnType<typeof client>;
 
-const synced = (c: Client) => new Promise<void>((r) => (c.provider.synced ? r() : c.provider.once("sync", (ok: boolean) => ok && r())));
+/** The server's document, as a fresh client would see it. */
+async function serverJSON() {
+  const c = new NetClient(s, alice.token, ws, pageId, alice.user.id);
+  await c.load();
+  return { json: c.json(), texts: c.texts() };
+}
 
-// Seeded PRNG so failures are reproducible.
 function rng(seed: number) {
   return () => {
     seed = (seed * 1664525 + 1013904223) % 4294967296;
@@ -45,180 +60,129 @@ function rng(seed: number) {
   };
 }
 
-function paragraphs(frag: Y.XmlFragment) {
-  return frag.toArray().filter((e): e is Y.XmlElement => e instanceof Y.XmlElement && e.nodeName === "paragraph");
-}
-
-function textOf(p: Y.XmlElement): Y.XmlText {
-  let t = p.toArray().find((c) => c instanceof Y.XmlText) as Y.XmlText | undefined;
-  if (!t) {
-    t = new Y.XmlText();
-    p.insert(0, [t]);
-  }
-  return t;
-}
-
-/** One random edit, the kinds of change a ProseMirror binding makes. */
-function randomEdit(c: Client, rand: () => number, tag: string) {
-  c.doc.transact(() => {
-    const ps = paragraphs(c.frag);
-    const roll = rand();
-    if (roll < 0.15 || ps.length === 0) {
-      const p = new Y.XmlElement("paragraph");
-      p.setAttribute("blockId", newId());
-      p.insert(0, [new Y.XmlText(`${tag}-new `)]);
-      c.frag.insert(1 + Math.floor(rand() * (c.frag.length - 1 + 1)), [p]);
-    } else if (roll < 0.7) {
-      const t = textOf(ps[Math.floor(rand() * ps.length)]!);
-      t.insert(Math.floor(rand() * (t.length + 1)), tag);
-    } else if (roll < 0.85) {
-      const t = textOf(ps[Math.floor(rand() * ps.length)]!);
-      if (t.length > 2) {
-        const at = Math.floor(rand() * (t.length - 1));
-        t.delete(at, Math.min(2, t.length - at));
-      }
-    } else if (roll < 0.95) {
-      const t = textOf(ps[Math.floor(rand() * ps.length)]!);
-      if (t.length > 1) t.format(0, Math.ceil(t.length / 2), { bold: {} });
-    } else if (ps.length > 2) {
-      const victim = ps[Math.floor(rand() * ps.length)]!;
-      c.frag.delete(c.frag.toArray().indexOf(victim), 1);
+let fresh = 0;
+function randomEdit(c: NetClient, rand: () => number) {
+  const blocks = c.blocks().filter((b) => b.text);
+  if (!blocks.length) return;
+  const b = blocks[Math.floor(rand() * blocks.length)]!;
+  const len = readText(c.view, b).units.length;
+  c.edit((v: MemoryState, apply) => {
+    const k = rand();
+    if (k < 0.5) {
+      const op = insertOps(v, c.clock, v.getBlock(b.id)!, Math.floor(rand() * (len + 1)), [..."ab".slice(0, 1 + Math.floor(rand() * 2))]);
+      if (op) apply(op);
+    } else if (k < 0.65 && len) {
+      const from = Math.floor(rand() * len);
+      for (const op of deleteOps(v, c.clock, v.getBlock(b.id)!, from, Math.min(len, from + 2))) apply(op);
+    } else if (k < 0.72 && len > 1) {
+      for (const op of markOps(v, c.clock, v.getBlock(b.id)!, 0, 2, "bold", true)) apply(op);
+    } else if (k < 0.82 && len > 2) {
+      const id = `${c.session}-n${++fresh}`;
+      apply({ op: "split", id: b.id, at: readText(v, v.getBlock(b.id)!).ids[1 + Math.floor(rand() * (len - 1))]!, newId: id, newInstance: id, type: "paragraph", properties: {} });
+    } else if (k < 0.88) {
+      const sibs = c.blocks().filter((x) => x.text && x.parent_id === b.parent_id);
+      const i = sibs.findIndex((x) => x.id === b.id);
+      if (i > 0) apply({ op: "merge", into: sibs[i - 1]!.id, from: b.id });
+    } else if (k < 0.94) {
+      const id = `${c.session}-n${++fresh}`;
+      apply({ op: "create", id, type: "paragraph", parent: pageId, after: b.parent_id === pageId ? b.id : null, properties: {}, text: null });
+    } else {
+      apply({ op: "move", id: b.id, parent: pageId, after: null });
     }
   });
 }
 
-beforeAll(async () => {
-  s = await startServer();
-  alice = await s.login("alice@leaf.dev");
-  bob = await s.login("bob@leaf.dev");
-  const ws = alice.workspaces[0].id;
-  const r = await s.api(alice.token, "POST", "/api/pages", {
-    workspaceId: ws,
-    title: "Convergence",
-    content: [
-      { type: "paragraph", properties: { rich_text: [{ text: "alpha" }] } },
-      { type: "paragraph", properties: { rich_text: [{ text: "beta" }] } },
-      { type: "paragraph", properties: { rich_text: [{ text: "gamma" }] } },
-    ],
-  });
-  pageId = r.body.page.id;
-});
-
-afterAll(async () => {
-  for (const p of providers) p.destroy();
-  await s.close();
-});
-
-describe("real-time convergence over WebSocket", () => {
-  let a: Client, a2: Client, b: Client;
-
-  it("syncs the initial document to every client", async () => {
-    a = client(alice.token, "Alice");
-    a2 = client(alice.token, "Alice (tab 2)");
-    b = client(bob.token, "Bob");
-    await Promise.all([synced(a), synced(a2), synced(b)]);
-    for (const c of [a, a2, b]) expect(projectFragment(c.frag, pageId).title).toBe("Convergence");
+describe("sync over HTTP + WebSocket", () => {
+  it("loads the page with its records and text", async () => {
+    const a = await client(alice);
+    expect(a.texts()).toEqual(["First paragraph", "Second paragraph", "A task"]);
+    expect(a.view.getBlock(pageId)!.properties.title).toBe("Sync test");
   });
 
-  it("shares presence (awareness) between clients", async () => {
-    await waitFor(() => [...a.provider.awareness.getStates().values()].some((st: any) => st.user?.name === "Bob"), 5000, "Bob's presence at Alice");
-    const names = [...b.provider.awareness.getStates().values()].map((st: any) => st.user?.name).sort();
-    expect(names).toEqual(expect.arrayContaining(["Alice", "Alice (tab 2)", "Bob"]));
+  it("a transaction is confirmed to its sender and pushed to the others", async () => {
+    const [a, b] = [clients[0]!, await client(bob)];
+    const first = a.blocks()[0]!.id;
+    a.edit((v, apply) => apply(insertOps(v, a.clock, v.getBlock(first)!, 5, [..." (Alice)"])!));
+    await a.flush();
+    expect(a.replica.pending).toHaveLength(0);
+    await waitFor(() => b.texts()[0] === "First (Alice) paragraph", 3000, "Bob receives Alice's edit");
+  });
+
+  it("relays presence between clients on the page", async () => {
+    const [a, b] = clients;
+    a!.setPresence({ block: a!.blocks()[0]!.id, item: null });
+    await waitFor(() => [...b!.presence.values()].some((p) => p.user?.name === "Alice Chen"), 3000, "Bob sees Alice's cursor");
   });
 
   it("converges after interleaved concurrent edits from 3 clients", async () => {
+    const [a, b] = clients;
+    const c = await client(bob);
     const r = rng(42);
-    for (let round = 0; round < 60; round++) {
-      randomEdit(a, r, "A");
-      randomEdit(a2, r, "a");
-      randomEdit(b, r, "B");
-      if (round % 7 === 0) await sleep(5); // let some messages cross mid-stream
+    for (let i = 0; i < 120; i++) {
+      const who = [a!, b!, c][Math.floor(r() * 3)]!;
+      randomEdit(who, r);
+      if (r() < 0.3) await who.flush();
     }
-    await waitFor(() => a.frag.toString() === b.frag.toString() && b.frag.toString() === a2.frag.toString(), 8000, "convergence");
-    expect(Y.encodeStateVector(a.doc)).toEqual(Y.encodeStateVector(b.doc));
+    await Promise.all([a!.flush(), b!.flush(), c.flush()]);
+    const truth = await serverJSON();
+    for (const x of [a!, b!, c]) await waitFor(() => x.json() === truth.json, 5000, "client converges");
   });
 
   it("merges offline edits on reconnect (both sides edited the same paragraph)", async () => {
-    b.provider.disconnect();
-    await sleep(50);
-    const pa = textOf(paragraphs(a.frag)[0]!);
-    const pb = textOf(paragraphs(b.frag)[0]!);
-    pa.insert(0, "[online-A]");
-    pb.insert(pb.length, "[offline-B]");
-    const extra = new Y.XmlElement("paragraph");
-    extra.setAttribute("blockId", "offline-block");
-    extra.insert(0, [new Y.XmlText("written while offline")]);
-    b.frag.insert(b.frag.length, [extra]);
-    await sleep(100);
-    expect(a.frag.toString()).not.toContain("offline-B");
-    b.provider.connect();
-    await waitFor(() => a.frag.toString() === b.frag.toString() && a2.frag.toString() === b.frag.toString(), 8000, "offline merge");
-    const first = textOf(paragraphs(a.frag)[0]!).toString();
-    expect(first).toContain("[online-A]");
-    expect(first).toContain("[offline-B]");
-    expect(a.frag.toString()).toContain("written while offline");
+    const [a, b] = clients;
+    const id = a!.blocks().find((x) => x.text)!.id;
+    b!.goOffline();
+    b!.edit((v, apply) => apply(insertOps(v, b!.clock, v.getBlock(id)!, 0, [..."[Bob offline] "])!));
+    a!.edit((v, apply) => apply(insertOps(v, a!.clock, v.getBlock(id)!, readText(v, v.getBlock(id)!).units.length, [..." [Alice online]"])!));
+    await a!.flush();
+    expect(b!.texts().join("")).not.toContain("Alice online");
+    await b!.goOnline();
+    const truth = await serverJSON();
+    expect(truth.texts.join("|")).toContain("[Bob offline]");
+    expect(truth.texts.join("|")).toContain("[Alice online]");
+    for (const x of [a!, b!]) await waitFor(() => x.json() === truth.json, 5000, "converged after reconnect");
   });
 
-  it("projects the converged document into the block table", async () => {
-    await waitFor(async () => {
-      const server = (await s.api(alice.token, "GET", `/api/pages/${pageId}/blocks`)).body;
-      const proj = projectFragment(a.frag, pageId);
-      return JSON.stringify(server.page.content) === JSON.stringify(proj.content);
-    }, 5000, "projection catches up");
-    const server = (await s.api(alice.token, "GET", `/api/pages/${pageId}/blocks`)).body;
-    const proj = projectFragment(a.frag, pageId);
-    expect(server.page.properties.title).toBe("Convergence");
-    const rows = new Map(server.blocks.map((blk: any) => [blk.id, blk]));
-    expect(server.blocks).toHaveLength(proj.blocks.length);
-    for (const blk of proj.blocks) {
-      const row: any = rows.get(blk.id);
-      expect(row, `block ${blk.id} in DB`).toBeTruthy();
-      expect(row.type).toBe(blk.type);
-      expect(row.properties).toEqual(blk.properties);
-      expect(row.parent_id).toBe(pageId);
-    }
-    expect(rows.has("offline-block")).toBe(true);
-    // Edits are attributed to the users who made them.
-    const editors = new Set(server.blocks.map((blk: any) => blk.last_edited_by));
-    expect(editors.has(bob.user.id) || editors.has(alice.user.id)).toBe(true);
+  it("keeps the block table and derived text in step with the edits", async () => {
+    const truth = await serverJSON();
+    const { blocks } = (await s.api(alice.token, "GET", `/api/pages/${pageId}/blocks`)).body;
+    const live = blocks.filter((b: any) => b.properties.rich_text);
+    const restText = new Set(live.map((b: any) => b.properties.rich_text.map((r: any) => r.text).join("")));
+    expect(truth.texts.filter((t) => !restText.has(t))).toEqual([]);
   });
 
   it("pushes server-side edits (REST rename) to connected editors", async () => {
-    await s.api(bob.token, "PATCH", `/api/pages/${pageId}`, { title: "Converged!" });
-    await waitFor(() => projectFragment(a.frag, pageId).title === "Converged!" && projectFragment(b.frag, pageId).title === "Converged!", 5000, "title broadcast");
+    await s.api(alice.token, "PATCH", `/api/pages/${pageId}`, { title: "Renamed via REST" });
+    await waitFor(() => clients[0]!.view.getBlock(pageId)!.properties.title === "Renamed via REST", 3000, "rename reaches the editor");
   });
 
-  it("ignores edits from read-only share-link viewers", async () => {
+  it("rejects transactions from read-only share-link viewers and non-members", async () => {
     const share = (await s.api(alice.token, "PUT", `/api/pages/${pageId}/share`, { enabled: true, access: "view" })).body.share;
-    const viewer = client("", "Viewer", { share: share.token });
-    await synced(viewer);
-    expect(viewer.frag.toString()).toBe(a.frag.toString());
-    textOf(paragraphs(viewer.frag)[0]!).insert(0, "VANDAL");
-    await sleep(300);
-    expect(a.frag.toString()).not.toContain("VANDAL");
-    viewer.provider.destroy();
+    const carol = (await s.api(null, "POST", "/api/auth/signup", { email: "carol-sync@x.dev", name: "Carol", password: "secret1" })).body;
+    const id = clients[0]!.blocks()[0]!.id;
+    const tx = { id: "evil", ops: [{ op: "update", id, properties: { checked: true } }] };
+    const r = await s.api(carol.token, "POST", "/api/saveTransactions", { transactions: [tx], session: "x" }, { "x-leaf-share": share.token });
+    expect(r.status).toBe(403);
+    expect((await s.api(null, "POST", "/api/saveTransactions", { transactions: [tx], session: "x" })).status).toBe(401);
   });
 
-  it("rejects unauthenticated connections", async () => {
-    const status = await new Promise<number>((resolve) => {
-      const sock = new WebSocket(`${s.wsUrl}/ws/doc/${pageId}`);
-      sock.on("unexpected-response", (_req, res) => resolve(res.statusCode ?? 0));
-      sock.on("open", () => resolve(101));
+  it("rejects unauthenticated WebSocket connections", async () => {
+    const sock = new WebSocket(`${s.wsUrl}/ws/events?workspace=${ws}`);
+    const code = await new Promise<string>((r) => {
+      sock.on("unexpected-response", (_req, res) => r(String(res.statusCode)));
+      sock.on("open", () => r("open"));
     });
-    expect(status).toBe(401);
+    expect(code).toBe("401");
   });
 
   it("persists: a restarted server serves the identical document", async () => {
-    const expected = a.frag.toString();
-    for (const p of providers) p.destroy();
-    providers.length = 0;
-    await sleep(100);
-    const dbFile = s.dbFile;
-    await s.close();
-    const reopened = new Leaf({ dbFile });
-    const live = reopened.docs.get(pageId);
-    expect(getFragment(live.doc).toString()).toBe(expected);
-    reopened.close();
-    s = await startServer({ dir: s.dir, seed: false });
+    const before = await serverJSON();
+    // A second server process on the same data file (the first one's memory isn't used).
+    const leaf2 = new Leaf({ dbFile: s.dbFile, aiModel: null });
+    const { records, instances } = leaf2.sync.docRecords(pageId);
+    const c = new NetClient(s, alice.token, ws, pageId, alice.user.id);
+    c.replica.load(records, instances);
+    expect(c.json()).toBe(before.json);
+    leaf2.close();
   });
 });

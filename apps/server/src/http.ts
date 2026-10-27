@@ -136,6 +136,44 @@ export function createHttpServer(leaf: Leaf) {
       }),
     };
   });
+  // ---------------------------------------------------------------- sync (Notion's endpoints)
+  /**
+   * loadPageChunk: a document's records and the text instances they use (page load, and
+   * catch-up after reconnecting). Here a "chunk" is the whole document.
+   */
+  const loadPageChunk = (c: Ctx, id: string) => {
+    can(c, id, "view");
+    return leaf.sync.docRecords(id);
+  };
+  route("POST", "/api/loadPageChunk", (c) => loadPageChunk(c, String(c.body?.pageId ?? "")));
+  route("GET", "/api/docs/:id", (c) => loadPageChunk(c, c.params.id!));
+  /**
+   * syncRecordValues: the current version of records the client has stale copies of
+   * (the client compares versions it was told about with the ones it holds).
+   */
+  route("POST", "/api/syncRecordValues", (c) => {
+    const ids: string[] = (Array.isArray(c.body?.requests) ? c.body.requests : []).slice(0, 1000).map((r: any) => String(r?.id ?? r));
+    const records = ids
+      .map((id) => leaf.store.get(id))
+      .filter((b): b is NonNullable<typeof b> => !!b && leaf.access(c.user?.id ?? null, b.id, c.share) !== null);
+    return { records };
+  });
+  /**
+   * saveTransactions: commit a transaction, checked op by op against the caller's access,
+   * applied, broadcast to the other clients following the documents it touched, and
+   * returned as the confirmation.
+   */
+  const saveTransactions = (c: Ctx) => {
+    const user = me(c);
+    const session = String(c.body?.session ?? "").slice(0, 64);
+    if (!session) throw new HttpError(400, "session required");
+    const txs: any[] = Array.isArray(c.body?.transactions) ? c.body.transactions : [c.body?.tx];
+    const commits = txs.map((t) => leaf.sync.commit(user.id, session, t, (b) => leaf.access(user.id, b.id, c.share) === "edit"));
+    return { commit: commits[commits.length - 1], commits };
+  };
+  route("POST", "/api/saveTransactions", saveTransactions);
+  route("POST", "/api/tx", saveTransactions);
+
   route("GET", "/api/pages/:id", (c) => {
     const page = can(c, c.params.id!, "view");
     if (page.type !== "page") throw new HttpError(400, "Not a page");
@@ -198,12 +236,16 @@ export function createHttpServer(leaf: Leaf) {
   route("DELETE", "/api/pages/:id/favorite", (c) => ({ favorites: leaf.setFavorite(me(c).id, c.params.id!, false) }));
 
   // ---------------------------------------------------------------- blocks (Notion-API style)
-  route("GET", "/api/blocks/:id", (c) => ({ block: can(c, c.params.id!, "view") }));
+  /** Deleted content blocks are kept as tombstones (undo, concurrent edits); to the API they're gone. */
+  const live = (c: Ctx, id: string) => {
+    const b = can(c, id, "view");
+    if (b.archived && b.type !== "page" && b.type !== "database") throw new HttpError(404, "Not found");
+    return b;
+  };
+  route("GET", "/api/blocks/:id", (c) => ({ block: live(c, c.params.id!) }));
   route("GET", "/api/blocks/:id/children", (c) => {
-    const b = can(c, c.params.id!, "view");
-    if (b.type === "page") leaf.pageBlocks(b.id);
-    const fresh = leaf.store.get(b.id)!;
-    return { results: fresh.content.map((id) => leaf.store.get(id)).filter(Boolean) };
+    const b = live(c, c.params.id!);
+    return { results: b.content.map((id) => leaf.store.get(id)).filter((k) => k && !(k.archived && k.type !== "page" && k.type !== "database")) };
   });
   route("POST", "/api/blocks/:id/children", (c) => {
     can(c, c.params.id!, "edit");
@@ -278,9 +320,7 @@ export function createHttpServer(leaf: Leaf) {
   });
   route("POST", "/api/pages/:id/versions", (c) => {
     can(c, c.params.id!, "edit");
-    const id = leaf.docs.snapshot(c.params.id!, me(c).id, c.body.label ?? "Saved version");
-    leaf.docs.scheduleUnload(c.params.id!);
-    return { id };
+    return { id: leaf.sync.snapshot(c.params.id!, me(c).id, c.body.label ?? "Saved version") };
   });
   route("GET", "/api/versions/:id", (c) => {
     can(c, leaf.versionPageId(c.params.id!), "view");
@@ -329,7 +369,7 @@ export function createHttpServer(leaf: Leaf) {
     });
   }
 
-  route("GET", "/api/health", () => ({ ok: true, docsOpen: leaf.docs.docs.size, subscribers: leaf.hub.size }));
+  route("GET", "/api/health", () => ({ ok: true, subscribers: leaf.hub.size }));
 
   // ---------------------------------------------------------------- server
   const server = http.createServer(async (req, res) => {

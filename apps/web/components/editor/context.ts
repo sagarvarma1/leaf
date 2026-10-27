@@ -1,5 +1,6 @@
 "use client";
 import { createContext, useContext, type ComponentType } from "react";
+import type { SyncClient } from "@/lib/sync";
 
 /**
  * What node views need from the editor that renders them. TipTap renders React node
@@ -10,6 +11,7 @@ import { createContext, useContext, type ComponentType } from "react";
 export interface EditorContextValue {
   pageId: string;
   workspaceId: string;
+  sync: SyncClient;
   user: { name: string; color: string };
   readOnly: boolean;
   commentedBlocks: Set<string>;

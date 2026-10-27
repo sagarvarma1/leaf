@@ -8,7 +8,7 @@ import Document from "@tiptap/extension-document";
 import { Plugin, PluginKey, TextSelection, type EditorState, type Transaction } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { Node as PMNode } from "@tiptap/pm/model";
-import { ySyncPluginKey } from "y-prosemirror";
+import { remoteKey } from "./sync-binding";
 
 export const ID_TYPES = [
   "paragraph",
@@ -35,11 +35,10 @@ export const LeafDocument = Document.extend({ content: "title (block | layout)+"
 export const SyncedDocument = Document.extend({ content: "(block | layout)+" });
 
 /*
- * Schema rule for the nodes below: content expressions stay loose. When a concurrent
- * merge produces a shape the schema rejects, y-prosemirror deletes the offending element
- * from the shared doc on every client, so a strict rule turns a harmless leftover into
- * lost text. Leftovers (a nest with one child, a single column) are cleaned up only by
- * the local user's own edits (normalizeLayout) and the projection tolerates them.
+ * Schema rule for the nodes below: content expressions stay loose. The editor document is
+ * rendered from records that concurrent edits can leave in any shape (a nest with one
+ * child, a single column), so the schema accepts those; they're tidied only by the local
+ * user's own edits (normalizeLayout).
  */
 
 /**
@@ -278,7 +277,7 @@ export const BlockId = Extension.create({
         appendTransaction(trs: readonly Transaction[], _old: EditorState, state: EditorState) {
           if (!trs.some((t) => t.docChanged)) return null;
           // Remote changes already carry ids; only fix up local edits.
-          if (trs.every((t) => t.getMeta(ySyncPluginKey))) return null;
+          if (trs.every((t) => t.getMeta(remoteKey))) return null;
           const seen = new Set<string>();
           let tr: Transaction | null = null;
           state.doc.descendants((node: PMNode, pos: number) => {

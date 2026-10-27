@@ -9,9 +9,6 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
-  "dependencies": {
-    "yjs": "^13.6.27"
-  },
   "devDependencies": {
     "@types/node": "^22.15.0",
     "typescript": "~5.9.3",

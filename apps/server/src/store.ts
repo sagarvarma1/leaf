@@ -26,6 +26,8 @@ export function rowToBlock(r: Row): Block {
     last_edited_by: r.last_edited_by ?? null,
     last_edited_at: Number(r.last_edited_at),
     archived: Boolean(r.archived),
+    text: r.text ? JSON.parse(r.text) : null,
+    version: Number(r.version ?? 1),
   };
 }
 
@@ -48,8 +50,8 @@ export class BlockStore {
   insert(b: Block) {
     this.db
       .prepare(
-        `INSERT INTO blocks (id, type, workspace_id, parent_id, page_id, properties, content, created_by, created_at, last_edited_by, last_edited_at, archived)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO blocks (id, type, workspace_id, parent_id, page_id, properties, content, created_by, created_at, last_edited_by, last_edited_at, archived, text)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         b.id,
@@ -64,7 +66,46 @@ export class BlockStore {
         b.last_edited_by,
         b.last_edited_at,
         b.archived ? 1 : 0,
+        b.text ? JSON.stringify(b.text) : null,
       );
+    this.indexText(b);
+  }
+
+  /** Insert or replace a whole record (the sync engine writes records this way). */
+  put(b: Block) {
+    const old = this.get(b.id);
+    if (!old) return this.insert(b);
+    this.db
+      .prepare(
+        `UPDATE blocks SET type=?, workspace_id=?, parent_id=?, page_id=?, properties=?, content=?, created_by=?, created_at=?, last_edited_by=?, last_edited_at=?, archived=?, text=?, version=version+1 WHERE id=?`,
+      )
+      .run(
+        b.type,
+        b.workspace_id,
+        b.parent_id,
+        b.page_id,
+        JSON.stringify(b.properties),
+        JSON.stringify(b.content),
+        b.created_by,
+        b.created_at,
+        b.last_edited_by,
+        b.last_edited_at,
+        b.archived ? 1 : 0,
+        b.text ? JSON.stringify(b.text) : null,
+        b.id,
+      );
+    if (JSON.stringify(old.text ?? null) !== JSON.stringify(b.text ?? null)) this.indexText(b);
+  }
+
+  /** Which text instances a block shows (so text ops find the blocks they affect). */
+  private indexText(b: Block) {
+    this.db.prepare("DELETE FROM block_instances WHERE block_id = ?").run(b.id);
+    const ins = this.db.prepare("INSERT OR IGNORE INTO block_instances (block_id, instance_id) VALUES (?,?)");
+    for (const s of b.text ?? []) ins.run(b.id, s.i);
+  }
+
+  blocksOfInstance(instanceId: string): string[] {
+    return (this.db.prepare("SELECT block_id FROM block_instances WHERE instance_id = ?").all(instanceId) as Row[]).map((r) => r.block_id);
   }
 
   update(id: string, patch: Partial<Pick<Block, "parent_id" | "properties" | "content" | "archived" | "last_edited_by" | "last_edited_at" | "page_id">>) {
@@ -76,6 +117,7 @@ export class BlockStore {
       vals.push(k === "properties" || k === "content" ? JSON.stringify(v) : k === "archived" ? (v ? 1 : 0) : v);
     }
     if (!sets.length) return;
+    sets.push("version = version + 1");
     vals.push(id);
     this.db.prepare(`UPDATE blocks SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
   }
@@ -87,8 +129,9 @@ export class BlockStore {
     return (rows as Row[]).map(rowToBlock);
   }
 
+  /** Live content blocks of a page (or synced block container). */
   contentOf(pageId: string): Block[] {
-    return (this.db.prepare("SELECT * FROM blocks WHERE page_id = ?").all(pageId) as Row[]).map(rowToBlock);
+    return (this.db.prepare("SELECT * FROM blocks WHERE page_id = ? AND archived = 0").all(pageId) as Row[]).map(rowToBlock);
   }
 
   /** Pages and databases of a workspace (no content blocks). */
@@ -140,6 +183,10 @@ export class BlockStore {
 
   delete(ids: string[]) {
     const stmt = this.db.prepare("DELETE FROM blocks WHERE id = ?");
-    for (const id of ids) stmt.run(id);
+    const idx = this.db.prepare("DELETE FROM block_instances WHERE block_id = ?");
+    for (const id of ids) {
+      stmt.run(id);
+      idx.run(id);
+    }
   }
 }

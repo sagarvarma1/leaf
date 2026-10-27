@@ -1,15 +1,13 @@
 /**
  * Leaf AI against the real server, with scripted models (no network): the agent edits
- * through the CRDT as a live collaborator with presence, and "Discard" reverts exactly
- * its edits while a person's concurrent edits survive.
+ * through sync commits as a live collaborator with presence, and "Discard" reverts
+ * exactly its edits while a person's concurrent edits survive.
  */
-import { getFragment, projectFragment } from "@leaf/shared";
+import { insertOps } from "@leaf/shared";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import WebSocket from "ws";
-import { WebsocketProvider } from "y-websocket";
-import * as Y from "yjs";
 import { AI_USER } from "../src/ai/agent.js";
 import { MockModel, type AiModel, type Message, type MessageParam } from "../src/ai/model.js";
+import { NetClient } from "./client.js";
 import { startServer, waitFor, type TestServer } from "./helpers.js";
 
 /** Plays a fixed list of tool calls, one per turn, then ends. Records what it was sent. */
@@ -65,7 +63,7 @@ describe("Leaf AI", () => {
     expect((await s.api(carol.token, "POST", `/api/pages/${page.id}/ai`, { prompt: "summarize" })).status).toBe(403);
   });
 
-  it("summarizes a page by editing it through the CRDT, attributed to Leaf AI", async () => {
+  it("summarizes a page by editing it through sync commits, attributed to Leaf AI", async () => {
     model.current = new MockModel();
     const page = await newPage("Launch notes", [para("We ship the beta to design partners on Friday."), para("Pricing stays free until the public launch in spring."), para("Offline editing is the riskiest feature to finish.")]);
     const r = await run(page.id, "Summarize this page");
@@ -86,37 +84,54 @@ describe("Leaf AI", () => {
   it("works as a live collaborator: presence while typing, and Discard keeps a person's concurrent edits", async () => {
     model.current = new MockModel();
     const page = await newPage("Live", [para("Bob's line")]);
-    const doc = new Y.Doc();
-    const provider = new WebsocketProvider(`${s.wsUrl}/ws/doc`, page.id, doc, { WebSocketPolyfill: WebSocket as any, params: { token: bob.token }, disableBc: true });
-    await new Promise<void>((r) => provider.once("sync", () => r()));
+    // Bob follows the page like an open editor: loadPageChunk + the WebSocket.
+    const bobClient = await new NetClient(s, bob.token, ws, page.id, bob.user.id).open();
     const sawAi = { name: false, cursor: false };
-    provider.awareness.on("change", () => {
-      for (const st of provider.awareness.getStates().values()) {
-        if ((st as any).user?.id === AI_USER.id) {
+    const watch = setInterval(() => {
+      for (const p of bobClient.presence.values()) {
+        if (p.user?.id === AI_USER.id) {
           sawAi.name = true;
-          if ((st as any).cursor) sawAi.cursor = true;
+          if (p.sel?.item) sawAi.cursor = true;
         }
       }
-    });
+    }, 2);
 
     const r = await run(page.id, "Add an action items checklist");
     // While the AI types, Bob edits his own paragraph.
-    const bobText = () => (getFragment(doc).get(1) as Y.XmlElement).get(0) as Y.XmlText;
-    await waitFor(() => getFragment(doc).toString().includes("Action items"), 5000, "AI content reaches Bob");
-    bobText().insert(bobText().length, " (edited by Bob mid-run)");
+    await waitFor(() => bobClient.texts().includes("Action items"), 5000, "AI content reaches Bob");
+    const line = bobClient.blocks().find((b) => b.text && bobClient.text(b.id) === "Bob's line")!;
+    bobClient.edit((v, apply) => apply(insertOps(v, bobClient.clock, v.getBlock(line.id)!, 10, [..." (edited by Bob mid-run)"])!));
+    await bobClient.flush();
     await finished(page.id, r.id);
+    clearInterval(watch);
     expect(sawAi).toEqual({ name: true, cursor: true });
-    await waitFor(() => ![...provider.awareness.getStates().values()].some((st: any) => st.user?.id === AI_USER.id), 3000, "AI presence leaves");
-    expect(projectFragment(getFragment(doc), page.id).blocks.filter((b) => b.type === "to_do")).toHaveLength(3);
+    await waitFor(() => ![...bobClient.presence.values()].some((p) => p.user?.id === AI_USER.id), 3000, "AI presence leaves");
+    expect(bobClient.blocks().filter((b) => b.type === "to_do")).toHaveLength(3);
 
     const d = await s.api(alice.token, "POST", `/api/ai/runs/${r.id}/discard`);
     expect(d.body.run.status).toBe("discarded");
-    await waitFor(() => !getFragment(doc).toString().includes("Action items"), 3000, "discard reaches Bob");
-    const proj = projectFragment(getFragment(doc), page.id);
-    expect(proj.blocks.filter((b) => b.type === "to_do")).toHaveLength(0);
-    expect(proj.text).toContain("Bob's line (edited by Bob mid-run)");
-    provider.destroy();
-    doc.destroy();
+    await waitFor(() => !bobClient.texts().includes("Action items"), 3000, "discard reaches Bob");
+    expect(bobClient.blocks().filter((b) => b.type === "to_do")).toHaveLength(0);
+    expect(bobClient.texts()).toContain("Bob's line (edited by Bob mid-run)");
+    bobClient.close();
+  });
+
+  it("Discard keeps a person's typing inside a block the AI wrote", async () => {
+    // The AI writes a paragraph; Bob types into it; Discard removes the AI's text but not Bob's.
+    model.current = new ScriptModel([{ name: "insert_blocks", input: { markdown: "AI wrote this", position: "end" } }]);
+    const page = await newPage("Mixed", [para("start")]);
+    const bobClient = await new NetClient(s, bob.token, ws, page.id, bob.user.id).open();
+    const r = await run(page.id, "write");
+    await finished(page.id, r.id);
+    await waitFor(() => bobClient.texts().includes("AI wrote this"), 3000, "AI text arrives");
+    const id = bobClient.blocks().find((b) => b.text && bobClient.text(b.id) === "AI wrote this")!.id;
+    bobClient.edit((v, apply) => apply(insertOps(v, bobClient.clock, v.getBlock(id)!, 13, [..." + Bob"])!));
+    await bobClient.flush();
+    await s.api(alice.token, "POST", `/api/ai/runs/${r.id}/discard`);
+    await waitFor(() => !bobClient.texts().some((t) => t.includes("AI wrote")), 3000, "discard reaches Bob");
+    // The AI's words are gone; the block stays because Bob's words are in it.
+    expect(bobClient.texts()).toEqual(["start", " + Bob"]);
+    bobClient.close();
   });
 
   it("answers questions about the workspace with citations", async () => {

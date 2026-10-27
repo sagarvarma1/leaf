@@ -114,7 +114,8 @@ const editorText = (p) =>
     el.remove();
     return text;
   });
-const docXml = (p) => p.evaluate(() => window.__leafDoc.getXmlFragment("default").toString());
+/** The page's records rendered as an editor document (identical on every converged client). */
+const docXml = (p) => p.evaluate(() => window.__leafDocJSON(location.pathname.split("/").pop()));
 const shot = async (p, name) => SHOTS && p.screenshot({ path: path.join(SHOTS, `${name}.png`) });
 
 async function login(ctx, who) {
@@ -216,7 +217,7 @@ async function main() {
     await B.locator(".leaf-editor p", { hasText: "Hello from Alice" }).click();
     await B.keyboard.press("Home");
     await Promise.all([A.keyboard.type(" [A1][A2][A3]", { delay: 15 }), B.keyboard.type("[B1][B2][B3] ", { delay: 15 })]);
-    await until(async () => (await docXml(A)) === (await docXml(B)), "both Yjs documents identical");
+    await until(async () => (await docXml(A)) === (await docXml(B)), "both clients' documents identical");
     await until(async () => (await editorText(A)) === (await editorText(B)), "both editors render the same text");
     const t = await editorText(A);
     for (const tok of ["[A1][A2][A3]", "[B1][B2][B3]", "Hello from Alice"]) assert(t.includes(tok), `missing ${tok}`);
@@ -288,7 +289,7 @@ async function main() {
     await until(async () => (await B.locator(".leaf-editor strong", { hasText: "Hi Alice, Bob here" }).count()) === 1, "bold at Bob");
   });
 
-  await test("undo reverts only my own change (Yjs undo manager)", async () => {
+  await test("undo reverts only my own change (inverse ops of my own transactions)", async () => {
     await caretToEnd(B);
     await B.keyboard.press("Enter");
     await B.keyboard.type("bob-undo-me");
@@ -458,7 +459,7 @@ async function main() {
       const types = new Set(body.blocks.map((b) => b.type));
       const text = JSON.stringify(body.blocks);
       return ["heading_1", "to_do", "callout", "code", "quote", "divider", "bulleted_list_item", "toggle"].every((t) => types.has(t)) && text.includes("Slash task") && text.includes('"mention"');
-    }, "projection contains the new blocks", 10_000);
+    }, "block records contain the new blocks", 10_000);
     const md = await (await A.request.get(`${WEB}/api/pages/${pageId}/export`)).text();
     assert(md.includes("# Slash heading") || md.includes("## Slash heading"), "markdown export has heading");
     assert(md.includes("- [ ] Slash task"), "markdown export has to-do");
@@ -846,7 +847,10 @@ async function main() {
       await B.keyboard.type("Bob was online");
       assert(!(await editorText(B)).includes("Written on a plane"), "not synced while offline");
       await goOnline();
-      await until(async () => (await editorText(B)).includes("Written on a plane"), "Bob receives the offline edit", 30_000);
+      await until(async () => (await editorText(B)).includes("Written on a plane"), "Bob receives the offline edit", 30_000).catch(async (e) => {
+        const dbg = await B.evaluate((id) => ({ ...window.__leafSync.debug(), count: window.__leafSyncCount, inRecords: window.__leafDocJSON(id).includes("plane") }), arch.id);
+        throw new Error(`${e.message}\n    Bob sees: ${(await editorText(B)).slice(-120)}\n    Bob sync: ${JSON.stringify(dbg)}`);
+      });
       await until(async () => (await editorText(O)).includes("Bob was online"), "Alice receives Bob's edit", 30_000);
       await until(async () => (await docXml(O)) === (await docXml(B)), "documents converge");
       await until(async () => (await O.locator("[data-testid=synced-pill]").count()) === 1, "synced confirmation");

@@ -5,7 +5,7 @@ Leaf is two processes, and they deploy to two kinds of host:
 | Part | What it is | Where it runs |
 | --- | --- | --- |
 | `apps/web` | Next.js app (UI only) | Any Next.js host: **Vercel**, **Orbit**, Netlify, … |
-| `apps/server` | REST API, the Yjs WebSocket server, SQLite | A **long-running container with a disk**: Fly.io, Railway, Render, a VPS |
+| `apps/server` | REST API, the sync service (saveTransactions + the event WebSocket), SQLite | A **long-running container with a disk**: Fly.io, Railway, Render, a VPS |
 
 The server can't run as serverless functions: it holds live documents in memory, keeps
 WebSockets open for minutes, and writes SQLite to a local volume. That's the same reason
@@ -20,7 +20,7 @@ Browser ── https://leaf.example.com ──▶ Next.js (Vercel / Orbit)
 ## 1. The API server
 
 Build from the repo root with the [`Dockerfile`](Dockerfile). It needs a persistent volume at
-`/data` (SQLite + the Yjs update log) and listens on port 4000.
+`/data` (SQLite: records, text instances, history) and listens on port 4000.
 
 - **Fly.io**: [`deploy/fly.toml`](deploy/fly.toml) (commands at the top of the file).
 - **A VPS with Caddy**: [`deploy/docker-compose.yml`](deploy/docker-compose.yml) plus the

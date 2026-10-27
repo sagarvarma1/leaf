@@ -4,7 +4,7 @@
  * operations, the server applies them in order inside a SQLite transaction and broadcasts
  * the result. Each cell is an independent last-writer-wins register.
  */
-import { newId } from "./convert.js";
+import { newId } from "./types.js";
 import { evaluateFormula, FormulaError, parseDay, parseFormula, renameFormulaProp, toText, type Ast, type FormulaValue } from "./formula.js";
 import type {
   DatabaseProperties,

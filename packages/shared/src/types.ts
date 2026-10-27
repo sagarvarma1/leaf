@@ -4,6 +4,8 @@
  * up the tree and an ordered `content` array of child ids down the tree.
  */
 
+export const newId = (): string => globalThis.crypto.randomUUID();
+
 export type ContentBlockType =
   | "paragraph"
   | "heading_1"
@@ -78,6 +80,23 @@ export interface Block {
   last_edited_by: string | null;
   last_edited_at: number;
   archived: boolean;
+  /**
+   * Text blocks (and pages, for their title): the block's text as slices of text instances
+   * (CRDTs). `properties.rich_text` / `properties.title` are derived from it.
+   */
+  text?: Slice[] | null;
+  /**
+   * Record version, bumped by the server on every committed change (as in Notion). Clients
+   * keep the newest copy of a record whichever order updates arrive in.
+   */
+  version?: number;
+}
+
+/** A range of a text instance: [before(from), before(to)); null = the instance's start / end. */
+export interface Slice {
+  i: string;
+  from: string | null;
+  to: string | null;
 }
 
 /** A block produced by projecting a page document (no bookkeeping columns yet). */

@@ -18,13 +18,17 @@ pnpm dev       # http://localhost:3000 (ANTHROPIC_API_KEY in .env for real Claud
 
 ## 0:00 – 0:10 · Hook
 
-> "This is Leaf, a Notion I rebuilt from scratch. Every page is a tree of blocks, two people are
-> editing this one live over a CRDT, and in a minute an AI is going to join them."
+> "This is Leaf, a Notion I rebuilt from scratch, including the sync engine, which I built from
+> Notion's engineering blog. Every page is a tree of blocks, two people are editing this one live,
+> and in a minute an AI is going to join them."
 
 ## 0:10 – 0:30 · Real-time editing and the block model
 
 - Alice types `/`, picks **Heading 1**, types "Launch checklist". Bob types `[] ` and "Write the announcement".
 - Both type in the **same line** at once. Point at the named cursors.
+- Alice presses **Enter** in the middle of Bob's line while he keeps typing: his text follows into
+  the new block. "That's Notion's text-slices trick: Enter doesn't copy text, it splits a shared
+  text instance."
 - Alice presses **Tab** on a paragraph: it becomes a child of the one above. "Any block can have children."
 - Alice drags a block by ⋮⋮ onto the **right edge** of another: they become **columns**. Bob sees it.
 
@@ -33,13 +37,13 @@ pnpm dev       # http://localhost:3000 (ANTHROPIC_API_KEY in .env for real Claud
 - Alice clicks **✨ AI** → "Turn this page into an action-item checklist".
 - On **Bob's** screen: a "Leaf AI" avatar joins and its cursor types the list in.
 
-> "The AI isn't pasting text. Its edits are CRDT transactions with their own origin, so it shows
-> up like a teammate."
+> "The AI isn't pasting text. Its edits are transactions from its own session, so it shows up
+> like a teammate."
 
 - Bob keeps typing in his own line while the AI writes. Alice clicks **Discard changes**.
 
-> "Discard undoes exactly the AI's operations. Bob's edit from the middle of the run stays,
-> because it's a scoped undo in the CRDT, not a snapshot restore."
+> "Discard applies the inverse of exactly the AI's operations. Bob's edit from the middle of the
+> run stays, because it reverts operations, not a snapshot."
 
 - Alice asks "What did we decide about offline editing?" and clicks the citation.
 
@@ -61,22 +65,24 @@ pnpm dev       # http://localhost:3000 (ANTHROPIC_API_KEY in .env for real Claud
   counts "1 change saved on this device".
 - Wi-Fi back on: "✓ All changes synced", and the other window has the line.
 
-> "Pages are CRDT documents in IndexedDB, and a service worker serves the app shell. Offline edits
-> are just updates that haven't been delivered yet, so reconnecting needs no merge UI."
+> "Like Notion's offline mode: pages are kept in a record cache in IndexedDB, edits wait in a
+> transaction queue, and a service worker serves the app shell. On reconnect the queue goes up,
+> text merges as a CRDT and structure follows the server's order, so there's no merge UI."
 
 ## 1:20 – 1:45 · Underneath
 
 - Open `/api/pages/<id>/blocks` or **⋯ → Export as Markdown**:
 
-> "This is the block table the server projects from the CRDT: ids, types, parent pointers,
-> ordered children. Search, export, permissions and the AI all read it."
+> "These are the block records, the source of truth: ids, types, parent pointers, ordered
+> children, versions. The editor sends operations on them; search, export, permissions and the
+> AI read them."
 
 ## 1:45 – 2:00 · Close
 
 > "It deploys as a split stack: the Next app on Vercel or Orbit, the realtime server in a
 > container, with signed WebSocket tickets between them. Visitors get a private sandbox.
-> It has 78 unit and integration tests and 34 browser checks, including a multi-client
-> convergence test and a test where the AI is discarded while a person keeps typing."
+> It has 88 unit and integration tests and 35 browser checks, including a convergence simulation
+> that ran clean for a thousand random scenarios."
 
 ---
 
@@ -90,52 +96,69 @@ so it gets the editor, comments and history for free. The ordered `content` arra
 Notion's API exposes it. I kept two Notion details: list items are blocks (the `<ul>` is a
 rendering concern), and a sub-page is a block inside its parent's content.
 
-**CRDT vs OT: why Yjs?**
-OT transforms concurrent operations against each other, which needs a central authority to
-order them. That's fine for a server-first product, and it's roughly how Notion's transactions work.
-A CRDT makes operations commutative, so replicas converge regardless of order. I got offline editing,
-reconnect diffing (state vectors) and per-user undo almost for free, and the server becomes a relay
-plus storage. The tradeoffs: metadata overhead (tombstones, which Yjs GC keeps small), less control
-over intent (a delete beats a concurrent edit inside the deleted block), and the doc isn't directly
-queryable, which is why I project it into the block table.
+**How does sync work? Why not just use Yjs?**
+Leaf started on Yjs, one CRDT document per page. I replaced it with my own engine built from
+Notion's engineering posts, because that design separates two problems that want different
+answers:
+- **Structure** (create, move, delete, type, properties) is operations on block records,
+  grouped into transactions that the server orders. That gives clear semantics (the server's
+  order wins), a permission check per operation, and moves that can't lose edits.
+- **Text** is the one part that needs character-level merging, so only text is a CRDT: an RGA
+  with Notion's ordering rule and Peritext formatting.
 
-**If the Yjs doc is the source of truth, is the block table really the model?**
-For page bodies the doc is authoritative and the table is a projection that trails by about 300 ms.
-I enforce one write path: every server-side change to content (REST block writes, renames, sub-page
-links, version restore) is applied as a Yjs transaction on the live doc, then projected. So the two
-can't diverge, and editors receive server writes like a collaborator's. Structure (tree, databases,
-cells) is written to the table directly with server-ordered ops. If I had to make the table
-authoritative for content too, I'd move to an op log over blocks (Notion-style transactions) and
-make the editor a client of that.
+The client applies its own transactions at once, queues them in IndexedDB, and re-applies
+whatever is still pending on top of every confirmed commit (a rebase). docs/SYNC.md maps each
+piece to the posts.
+
+**Walk me through the text CRDT.**
+- **Ids and ordering.** Every character has an id, `session@clock` with a Lamport clock, and is
+  inserted after an "origin" character, so the text is a tree read in pre-order. Siblings with
+  the same origin sort newest first, with the session as tie-breaker. Every replica builds the
+  same tree in any delivery order, and two people typing at the same spot get two intact runs.
+- **Deletes and run-length.** Deletes leave tombstones, because offline edits may still point at
+  a deleted character. A run typed in one go is one op with consecutive clocks.
+- **Formatting (Peritext).** A mark op has anchors on the before or after side of an item. Bold
+  ends before the next character, so typing at its end stays bold. A link ends after its last
+  character, so it doesn't grow. The newest op of each mark kind wins.
+
+**What are text instances and slices, and why bother?**
+A block's text isn't its own CRDT. It's slices of a text instance.
+- **Enter** in the middle of a block doesn't copy text: the new block takes the tail of the same
+  instance. If someone is typing in that tail (even offline), their insert lands in the
+  instance's tail and shows up in the new block.
+- **Backspace** appends the second block's slices to the first, so concurrent typing in the
+  merged-away block isn't lost.
+- Every block's first slice is its own instance, named after the block, so offset 0 always has
+  a home.
+- Notion uses search labels to find slices after concurrent splits. My server orders splits, so
+  it finds the block that currently holds the split point.
 
 **How is it persisted? What if the server crashes mid-edit?**
-Every incoming update is appended to an `yupdates` log in SQLite before anything else, then
-compacted into a single `ydocs` state on a debounce, when the last editor leaves, and at shutdown.
-On load I apply the snapshot plus any log entries. There's a test that opens a second instance on
-the same database without a clean shutdown and checks that the un-compacted edits are there.
-Clients also keep an IndexedDB replica, so even a lost server write would be re-sent on reconnect,
-because the sync handshake exchanges whatever the server lacks.
+- **Server.** Each transaction commits in one SQLite transaction: records, record versions and
+  the text instances it changed. Nothing is acknowledged before it's on disk.
+- **Client.** The TransactionQueue is in IndexedDB, so a reload or crash while offline doesn't
+  lose edits. Re-sent transactions are safe: inserts are deduplicated by id, visibility and
+  marks are idempotent, and splits and merges recognise themselves.
 
 **How do block ids survive collaboration?**
-Each block node carries a `blockId` attribute. Splitting a node copies attributes, so a client
-plugin re-keys duplicates after local edits. The server re-keys any duplicates it still sees, and
-any id that belongs to another page (paste across pages), during projection. Stable ids make the
-projection a diff (only changed rows are written) and let comments anchor to blocks.
+Each editor block node carries a `blockId`. A client plugin re-keys duplicates after splits and
+pastes. Ids derived for presentation (the paragraph inside a list item, an empty page's
+placeholder) are deterministic, so two people typing into an empty page create the same block
+and share its text instance.
 
 **How does presence work?**
-Yjs awareness on the same socket: an ephemeral per-client state (name, color, cursor as relative
-positions) with a heartbeat and timeout. The server remembers which awareness ids each socket
-introduced and removes them when it closes, so cursors don't linger. Avatars are derived from the
-same states, de-duplicated per user.
+Over the same WebSocket, per document: a caret is `{ block, item }`, anchored to a character
+rather than an offset, so it doesn't drift when others type earlier in the line. The server
+relays it to the page's other followers and drops it when the socket closes. Leaf AI publishes
+presence from the server.
 
 **How would you scale this?**
-The constraint is that all editors of one doc should hit the same in-memory replica. I'd route by
-page id (consistent hashing or a directory service) to an owner node, with WebSockets going through
-a sticky load balancer. Owner nodes persist to Postgres (state + update log) or an object store
-for snapshots, and the workspace event Hub becomes Redis/NATS pub/sub. Hot docs can shard
-awareness separately. For read scale, the projection feeds a search index (OpenSearch) and
-caches. Because a CRDT merges in any order, a node failover can rebuild the doc from storage plus
-the clients' replicas without losing edits.
+- **Commits per page are serialized** (they're server-ordered), so I'd route each page to an
+  owner node by page id, with sticky WebSockets.
+- **Storage and fan-out:** records and text instances in Postgres, and the hub becomes
+  Redis/NATS pub/sub.
+- **Reads:** search goes to OpenSearch fed by commits.
+- **Clients don't change:** they already rebase on commits and can reload a page from any node.
 
 **How do you handle conflicts in databases?**
 Cells are last-writer-wins registers applied in server order, so two people editing different cells
@@ -144,23 +167,27 @@ validated and applied in one SQLite transaction. I chose not to put databases in
 cells are atomic values and LWW matches what users expect from a cell.
 
 **What was hardest?**
-Making the editor schema and the block model agree. ProseMirror needs list containers, toggle
-summaries and a title node, while the block model wants flat list items and child arrays. The
-convert module (with round-trip tests) is the contract between them. The second hardest was
-avoiding duplicate initial content: an editor bound to an empty Yjs fragment fills in a default
-paragraph, and two clients doing that at once merge into duplicates. So the server always creates
-the document, and the client only mounts the editor once the doc has content.
+- **The bridge between the editor and the records.** ProseMirror needs list containers, toggle
+  summaries and a title node, while the block model wants flat list items and child arrays.
+  `toPM` / `fromPM` are the contract, tested as a fixed point (records → editor → records
+  produces no ops). Recognising Enter and Backspace as split and merge (instead of
+  delete + insert) is what makes concurrent typing follow the text.
+- **A real bug the browser suite found:** after an offline reload, the client restored its
+  queue in reverse. The CRDT still converged on the server, but ops that had waited for their
+  origin were never broadcast when released. Now the queue keeps its order, and commits
+  broadcast what took effect, including released ops.
 
-**How does the AI fit into a CRDT editor? Why not just insert its output?**
-The agent runs on the server as a tool-use loop (Claude Opus 5.5) with block-level tools: read
-page, insert Markdown as blocks, rewrite a block, search, read and edit databases. Every page
-edit is a Yjs transaction on the live document with one origin object per run, so it streams
-into everyone's editor through the normal sync path, and the AI has its own awareness state
-(name, color, a cursor placed with Yjs relative positions inside the text it's typing). The
-origin is what makes Discard work: a `Y.UndoManager` tracking only that origin reverts exactly
-the AI's operations, even after someone typed around them. A snapshot restore would wipe their
-work. Things that aren't in the page doc (new pages, rows, cells) are logged and reverted
-separately, and a cell is restored only if nobody changed it since.
+**How does the AI fit into a collaborative editor? Why not just insert its output?**
+- **A real collaborator.** The agent runs on the server as a tool-use loop (Claude Opus 5.5)
+  with block-level tools: read page, insert Markdown as blocks, rewrite a block, search, read
+  and edit databases. Every page edit is a commit from the run's own sync session, so it streams
+  into everyone's editor, and its cursor is server-side presence that follows the text it types.
+- **Discard.** Every op the engine applies returns its inverse, and the run keeps them. Discard
+  applies them newest first. Text inverses hide exactly the AI's characters, so people's edits
+  made during the run survive, and a block the AI wrote that someone typed into is kept with
+  their words. A snapshot restore would wipe their work.
+- **Outside the page.** New pages, rows and cells are logged and reverted separately, and a cell
+  is restored only if nobody changed it since.
 
 **How do you keep the AI from doing damage?**
 It runs with the requesting user's permissions, only edits blocks on the page it was started
@@ -172,22 +199,20 @@ demos there's a deterministic mock model that drives the same loop and tools.
 **How do children of any block work if ProseMirror paragraphs can't contain blocks?**
 A block with children is wrapped in a `nest` node: the first child is the block itself (it keeps
 its id) and the rest are its children. That's the same shape list items and toggles already
-use, so the projection just treats the head as the parent. The block table sees an ordinary
+use, so reading the editor just treats the head as the parent. The block table sees an ordinary
 paragraph whose `content` holds its children. Turn-into restructures instead of lifting, so a
 paragraph with children becomes a toggle or bullet that still holds them.
 
 **What was the subtle bug class in collaborative layout?**
-Schema validation. When a merged Yjs tree doesn't fit the ProseMirror schema, y-prosemirror
-*deletes* the element from the shared doc, on every client. If columns required two columns, two
-people each removing a different column at once would leave an "invalid" list and lose its
-content. So layout schemas are lenient, leftovers are allowed, and cleanup (unwrapping a
-one-child nest) only runs inside the local user's own edits. If every client "fixed" remote
-leftovers, two of them could fix the same thing concurrently and duplicate content.
+Concurrent edits can leave shapes nobody typed: a column list with one column, a nest with one
+child. The editor schema stays lenient so those still render, and cleanup only runs inside the
+local user's own edits. If every client "fixed" remote leftovers, two of them could fix the
+same thing concurrently and duplicate content.
 
 **How are synced blocks built?**
-The synced content is its own Yjs document owned by a container block, exactly like a page. Each
-page that shows it holds an instance block pointing at the container and renders a nested
-editor bound to that document, so cursors, undo and offline work inside it for free. Pasting
+The synced content is its own document: a container block that owns its blocks, exactly like a
+page. Each page that shows it holds an instance block pointing at the container and renders a
+nested editor on the container's records, so cursors, undo and offline work inside it too. Pasting
 an instance keeps the container id, which is how you make another live copy. Access follows the
 container's ancestry, and search indexes the content under the container and credits every
 page that shows it.
@@ -212,6 +237,6 @@ realtime check goes through tickets. Public visitors get 24-hour sandboxes with 
 and an hourly sweep deletes them completely.
 
 **What would you test next?**
-A long-running fuzz test that randomizes editor-level operations (through a headless ProseMirror +
-y-prosemirror binding rather than raw Yjs), and network fault injection (dropped and reordered
-messages) between clients and the server.
+The convergence simulation drives the engine's operations directly. Next I'd randomize
+editor-level edits through a headless ProseMirror and the real binding, and inject network
+faults (dropped, duplicated and reordered messages) between real clients and the server.

@@ -3,8 +3,8 @@ import type { Block } from "@leaf/shared";
 import type { Editor as TEditor } from "@tiptap/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import { useCollab, type Collab } from "@/lib/collab";
-import { keepUrls, useOnline } from "@/lib/offline";
+import { syncFor, useDoc, usePresence, useSyncVersion, type SyncClient } from "@/lib/sync";
+import { keepUrls, markSaved, useOnline } from "@/lib/offline";
 import { setFavorites, upsertBlocks, useBlock, useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/session";
 import { AiPanel, useAiStatus } from "./AiPanel";
@@ -25,7 +25,7 @@ interface PageMeta {
 }
 
 interface Peer {
-  clientId: number;
+  key: string;
   name: string;
   color: string;
 }
@@ -50,8 +50,15 @@ export function PageView({
   const live = useBlock(pageId) ?? meta?.page;
   const blocks = useWorkspace((s) => s.blocks);
   const favorites = useWorkspace((s) => s.favorites);
-  const collab = useCollab(pageId, share);
-  const [peers, setPeers] = useState<Peer[]>([]);
+  // The tab's sync client; the page's records load into it (network, else offline cache).
+  const sync = useMemo(() => syncFor(me?.id ?? null, workspaceId), [me?.id, workspaceId]);
+  const doc = useDoc(sync, pageId);
+  useSyncVersion(sync);
+  const presence = usePresence(sync, pageId);
+  // A page loaded from the server is now on this device too.
+  useEffect(() => {
+    if (doc.ready && !doc.fromCache && !share) markSaved(pageId);
+  }, [doc.ready, doc.fromCache, pageId, share]);
   const [panel, setPanel] = useState<"comments" | "ai" | null>(null);
   const [aiBlock, setAiBlock] = useState<string | null>(null);
   const aiStatus = useAiStatus();
@@ -82,24 +89,15 @@ export function PageView({
   const readOnly = !meta || meta.access !== "edit" || !me;
   const user = useMemo(() => ({ name: me?.name ?? "Guest", color: me?.color ?? "#999" }), [me?.name, me?.color]);
 
-  // Presence: publish who we are, collect everyone else on the page.
-  useEffect(() => {
-    if (!collab) return;
-    const aw = collab.provider.awareness;
-    aw.setLocalStateField("user", { ...user, id: me?.id ?? null });
-    const update = () => {
-      const seen = new Map<string, Peer>();
-      aw.getStates().forEach((st: any, clientId: number) => {
-        if (clientId === aw.clientID || !st.user) return;
-        const key = st.user.id ?? `${st.user.name}${clientId}`;
-        if (!seen.has(key)) seen.set(key, { clientId, name: st.user.name, color: st.user.color });
-      });
-      setPeers([...seen.values()]);
-    };
-    aw.on("change", update);
-    update();
-    return () => aw.off("change", update);
-  }, [collab?.provider, user, me?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Everyone else on the page (one avatar per person, whatever the number of tabs).
+  const peers = useMemo(() => {
+    const seen = new Map<string, Peer>();
+    for (const p of presence) {
+      if (!p.user || p.session === sync.session || p.user.id === me?.id) continue;
+      if (!seen.has(p.user.id)) seen.set(p.user.id, { key: p.session, name: p.user.name, color: p.user.color });
+    }
+    return [...seen.values()];
+  }, [presence, sync, me?.id]);
 
   useEffect(() => {
     const h = (e: Event) => {
@@ -126,7 +124,7 @@ export function PageView({
   }, []);
 
   // Offline and this page was never downloaded to this device.
-  if (error === "offline" || (!online && collab?.local && !collab.ready)) {
+  if (error === "offline" || doc.error === "offline") {
     return (
       <div className="page-error" data-testid="not-offline">
         <div className="page-error-icon">☁️</div>
@@ -178,12 +176,12 @@ export function PageView({
           ))}
         </nav>
         <div className="topbar-right">
-          {collab && <SyncStatus collab={collab} online={online} />}
+          {doc.ready && <SyncStatus sync={sync} online={online} />}
           {meta?.access === "view" && <span className="status-pill muted">View only</span>}
           {page && <span className="muted small edited">Edited {timeAgo(page.last_edited_at)}</span>}
           <div className="presence" data-testid="presence">
             {peers.slice(0, 5).map((p) => (
-              <Avatar key={p.clientId} name={p.name} color={p.color} title={`${p.name} is here`} />
+              <Avatar key={p.key} name={p.name} color={p.color} title={`${p.name} is here`} />
             ))}
             {peers.length > 5 && <span className="avatar sm more">+{peers.length - 5}</span>}
           </div>
@@ -258,13 +256,13 @@ export function PageView({
                 </button>
               </div>
             )}
-            {collab?.ready && meta ? (
+            {doc.ready && meta && sync.view.getBlock(pageId) ? (
               <Editor
                 key={pageId}
                 pageId={pageId}
                 workspaceId={workspaceId}
-                doc={collab.doc}
-                provider={collab.provider}
+                sync={sync}
+                rootId={pageId}
                 user={user}
                 readOnly={readOnly}
                 commentedBlocks={openThreads}
@@ -351,16 +349,18 @@ export function PageView({
 }
 
 /**
- * Connection state for the open page. Offline edits are CRDT updates kept in IndexedDB, so
- * the message is "saved on this device", then "synced" once the server has merged them.
+ * Connection state for the open page. Offline edits are queued transactions kept in
+ * IndexedDB, so the message is "N changes saved on this device", then "synced" once the
+ * server has committed them.
  */
-function SyncStatus({ collab, online }: { collab: Collab; online: boolean }) {
+function SyncStatus({ sync, online }: { sync: SyncClient; online: boolean }) {
   const [flash, setFlash] = useState(false);
   const hadPending = useRef(0);
-  const live = collab.status === "connected" && collab.synced;
+  const pending = sync.pendingCount;
+  const live = online && sync.connected && pending === 0;
   useEffect(() => {
     if (!live) {
-      hadPending.current = Math.max(hadPending.current, collab.pending);
+      if (!online || !sync.connected) hadPending.current = Math.max(hadPending.current, pending);
       return;
     }
     if (!hadPending.current) return;
@@ -368,7 +368,7 @@ function SyncStatus({ collab, online }: { collab: Collab; online: boolean }) {
     setFlash(true);
     const t = setTimeout(() => setFlash(false), 2500);
     return () => clearTimeout(t);
-  }, [live, collab.pending]);
+  }, [live, pending, online, sync.connected]);
 
   if (live) {
     return flash ? (
@@ -377,8 +377,10 @@ function SyncStatus({ collab, online }: { collab: Collab; online: boolean }) {
       </span>
     ) : null;
   }
-  const n = collab.pending;
-  const offline = !online || collab.status === "disconnected";
+  const n = pending;
+  const offline = !online || !sync.connected;
+  // Online and just waiting for the server to confirm a keystroke: say nothing.
+  if (!offline && n <= 2) return null;
   return (
     <span className={`status-pill ${offline ? "offline" : ""}`} data-testid="offline-pill" title="Edits are kept on this device and merge with everyone else's when you reconnect">
       {offline ? (

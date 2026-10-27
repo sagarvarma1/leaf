@@ -2,23 +2,22 @@
 /*
  * Offline mode.
  *
- * Two layers, deliberately separate:
- *  1. Content: every page is a Yjs document. useCollab keeps a replica in IndexedDB for
- *     pages you open; `warmWorkspace` downloads the rest in the background. Edits made
- *     offline are ordinary CRDT updates and merge with everyone else's on reconnect, with
- *     no conflict UI because there is nothing to resolve.
+ * Two layers, deliberately separate (as in "How we made Notion available offline"):
+ *  1. Content: the sync client's RecordCache keeps each page's records and text in
+ *     IndexedDB; `warmWorkspace` downloads pages in the background, and they stay
+ *     followed so their copies keep up. Edits made offline wait in the TransactionQueue
+ *     (also IndexedDB) and are sent on reconnect: text merges as CRDT ops, structure is
+ *     ordered by the server.
  *  2. Shell: public/sw.js serves the app (HTML, JS, read-only API responses) from cache
  *     when the network is down, so a reload or a cold start works on a plane.
  *
- * Structural actions (creating pages, database rows, comments) still need the server;
- * they fail with a clear "you're offline" message instead of being queued.
+ * Each page is kept for one or more reasons (favorite, recently visited, part of the
+ * workspace's top pages), like Notion's offline page trees; it's dropped only when no
+ * reason is left. Database edits and comments still need the server.
  */
 import { useEffect, useSyncExternalStore } from "react";
-import { IndexeddbPersistence } from "y-indexeddb";
-import { WebsocketProvider } from "y-websocket";
-import * as Y from "yjs";
 import type { Block } from "@leaf/shared";
-import { wsBase, wsTicket } from "./api";
+import { clearSyncData, type SyncClient } from "./sync";
 
 // ---------------------------------------------------------------- network state
 
@@ -45,7 +44,10 @@ export function useOnline(): boolean {
 // ---------------------------------------------------------------- saved pages
 
 const SAVED_KEY = "leaf:offline";
-type Saved = Record<string, number>; // page id -> when its replica last matched the server
+/** page id -> when its cached copy last matched the server (Notion's lastDownloadedTimestamp). */
+type Saved = Record<string, number>;
+const REASONS_KEY = "leaf:offline-reasons";
+export type OfflineReason = "favorite" | "recent" | "workspace" | "inherited";
 let saved: Saved = {};
 const savedListeners = new Set<() => void>();
 
@@ -77,22 +79,6 @@ export function useSavedPages(): Saved {
     () => saved,
     () => saved,
   );
-}
-
-/** Unsynced local edit counts, kept across reloads so "N changes" survives an offline restart. */
-const PENDING_KEY = "leaf:pending:";
-export function getPending(pageId: string): number {
-  try {
-    return Number(localStorage.getItem(PENDING_KEY + pageId) ?? 0) || 0;
-  } catch {
-    return 0;
-  }
-}
-export function setPending(pageId: string, n: number) {
-  try {
-    if (n) localStorage.setItem(PENDING_KEY + pageId, String(n));
-    else localStorage.removeItem(PENDING_KEY + pageId);
-  } catch {}
 }
 
 // ---------------------------------------------------------------- service worker
@@ -149,37 +135,23 @@ export function useWarmState(): WarmState {
   );
 }
 
-/** Sync one document into IndexedDB and return the synced-block containers it shows. */
-async function syncDoc(id: string): Promise<string[]> {
-  const doc = new Y.Doc();
-  const idb = new IndexeddbPersistence(`leaf-page-${id}`, doc);
-  await idb.whenSynced;
-  const ticket = await wsTicket();
-  const provider = new WebsocketProvider(`${wsBase()}/ws/doc`, id, doc, { params: ticket ? { ticket } : {}, connect: false, maxBackoffTime: 4000 });
-  provider.awareness.setLocalState(null); // a background download, not a visitor: no presence
+/**
+ * Why each page is kept offline (Notion's offline_action rows): a page stays while any
+ * reason remains. Recomputed on every warm-up from favorites, recent visits and the
+ * workspace's top pages; sub-pages of a kept page are kept as "inherited".
+ */
+export function offlineReasons(): Record<string, OfflineReason[]> {
   try {
-    const ok = await new Promise<boolean>((resolve) => {
-      const t = setTimeout(() => resolve(false), 15_000);
-      provider.on("sync", (s: boolean) => s && (clearTimeout(t), resolve(true)));
-      provider.connect();
-    });
-    if (!ok) return [];
-    markSaved(id);
-    const synced: string[] = [];
-    const walk = (node: Y.XmlFragment | Y.XmlElement) => {
-      for (const child of node.toArray()) {
-        if (!(child instanceof Y.XmlElement)) continue;
-        if (child.nodeName === "syncedBlock" && child.getAttribute("syncId")) synced.push(String(child.getAttribute("syncId")));
-        walk(child);
-      }
-    };
-    walk(doc.getXmlFragment("default"));
-    return synced;
-  } finally {
-    provider.destroy();
-    await idb.destroy(); // waits for pending IndexedDB writes
-    doc.destroy();
+    return JSON.parse(localStorage.getItem(REASONS_KEY) ?? "{}");
+  } catch {
+    return {};
   }
+}
+
+function setReasons(r: Record<string, OfflineReason[]>) {
+  try {
+    localStorage.setItem(REASONS_KEY, JSON.stringify(r));
+  } catch {}
 }
 
 const MAX_WARM = 80;
@@ -190,11 +162,28 @@ let warmToken = 0;
  * of the tree, skipping pages whose replica is already newer than their last edit. Runs
  * one page at a time in the background; switching workspaces cancels it.
  */
-export async function warmWorkspace(workspaceId: string, blocks: Record<string, Block>, priority: string[]) {
+export async function warmWorkspace(sync: SyncClient, workspaceId: string, blocks: Record<string, Block>, favorites: string[], recent: string[]) {
   const token = ++warmToken;
   if (!isOnline()) return;
-  const pages = Object.values(blocks).filter((b) => b.type === "page" && !b.archived);
-  const order = [...new Set([...priority, ...pages.map((p) => p.id)])].filter((id) => blocks[id]?.type === "page").slice(0, MAX_WARM);
+  const alive = (b: Block | undefined) => !!b && b.type === "page" && !b.archived;
+  // Reasons, then an order: favorites and recent pages first, then the rest of the tree.
+  const reasons: Record<string, OfflineReason[]> = {};
+  const add = (id: string, r: OfflineReason) => alive(blocks[id]) && (reasons[id] = [...new Set([...(reasons[id] ?? []), r])]);
+  favorites.forEach((id) => add(id, "favorite"));
+  recent.forEach((id) => add(id, "recent"));
+  Object.values(blocks)
+    .filter((b) => alive(b) && !b.parent_id)
+    .forEach((b) => add(b.id, "workspace"));
+  for (const id of Object.keys(reasons)) {
+    for (const child of Object.values(blocks)) if (alive(child) && child.parent_id === id) add(child.id, "inherited");
+  }
+  const order = [...new Set([...favorites, ...recent, ...Object.keys(reasons), ...Object.values(blocks).filter(alive).map((b) => b.id)])]
+    .filter((id) => alive(blocks[id]))
+    .slice(0, MAX_WARM);
+  for (const id of order) if (!reasons[id]) reasons[id] = ["workspace"];
+  setReasons(reasons);
+
+  // Refetch only pages edited since they were last downloaded.
   const stale = order.filter((id) => !(saved[id] && saved[id]! >= (blocks[id]!.last_edited_at ?? 0)));
   const databases = Object.values(blocks).filter((b) => b.type === "database" && !b.archived);
   setWarm({ running: true, done: order.length - stale.length, total: order.length });
@@ -208,16 +197,11 @@ export async function warmWorkspace(workspaceId: string, blocks: Record<string, 
     ...databases.map((d) => `/api/databases/${d.id}`),
   ]);
 
-  const seenSynced = new Set<string>();
   for (const id of stale) {
     if (token !== warmToken || !isOnline()) break;
     try {
-      for (const syncId of await syncDoc(id)) {
-        if (seenSynced.has(syncId)) continue;
-        seenSynced.add(syncId);
-        keepUrls([`/api/synced-blocks/${syncId}`]);
-        await syncDoc(syncId);
-      }
+      await sync.keepDoc(id);
+      markSaved(id);
     } catch {
       // Skip pages we can't reach (deleted, permissions changed); the next run retries.
     }
@@ -253,16 +237,10 @@ export async function clearOfflineData() {
   try {
     await caches.delete("leaf-v1");
   } catch {}
-  try {
-    const dbs = (await indexedDB.databases?.()) ?? [];
-    await Promise.all(dbs.filter((d) => d.name?.startsWith("leaf-page-")).map((d) => new Promise((r) => {
-      const req = indexedDB.deleteDatabase(d.name!);
-      req.onsuccess = req.onerror = req.onblocked = r;
-    })));
-  } catch {}
+  await clearSyncData();
   saved = {};
   localStorage.removeItem(SAVED_KEY);
+  localStorage.removeItem(REASONS_KEY);
   localStorage.removeItem(RECENT_KEY);
-  for (const k of Object.keys(localStorage)) if (k.startsWith(PENDING_KEY)) localStorage.removeItem(k);
   savedListeners.forEach((l) => l());
 }

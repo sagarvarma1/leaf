@@ -20,7 +20,7 @@ export interface TestServer {
 export async function startServer(opts: { seed?: boolean; dir?: string; leaf?: Partial<LeafOptions> } = {}): Promise<TestServer> {
   const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), "leaf-test-"));
   const dbFile = path.join(dir, "leaf.db");
-  const leaf = new Leaf({ dbFile, persistDebounceMs: 50, projectDebounceMs: 20, unloadAfterMs: 200, snapshotIntervalMs: 60_000, aiModel: null, ...opts.leaf });
+  const leaf = new Leaf({ dbFile, indexDebounceMs: 20, snapshotIntervalMs: 60_000, aiModel: null, ...opts.leaf });
   if (opts.seed !== false) seed(leaf);
   const { server, wss } = createHttpServer(leaf);
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));

@@ -1,0 +1,551 @@
+import { describe, expect, it } from "vitest";
+import {
+  Clock,
+  commitDesired,
+  commitTransaction,
+  createBlocks,
+  deleteOps,
+  docBlocks,
+  fromPM,
+  insertOps,
+  markOps,
+  MemoryState,
+  ownSlice,
+  readText,
+  Replica,
+  stampInverse,
+  TextInstance,
+  toPM,
+  unitsText,
+  type Block,
+  type BlockInput,
+  type Commit,
+  type PMNode,
+  type RecordOp,
+  type TextOp,
+  type Transaction,
+} from "../src/index.js";
+
+// ---------------------------------------------------------------- helpers
+
+const PAGE = "P";
+function pageBlock(id = PAGE): Block {
+  return {
+    id,
+    type: "page",
+    workspace_id: "W",
+    parent_id: null,
+    page_id: null,
+    properties: { title: "" },
+    content: [],
+    created_by: null,
+    created_at: 0,
+    last_edited_by: null,
+    last_edited_at: 0,
+    archived: false,
+    text: ownSlice(id),
+  };
+}
+
+function seeded(inputs: BlockInput[]) {
+  const state = new MemoryState();
+  state.putBlock(pageBlock());
+  const clock = new Clock("seed");
+  const ids = createBlocks(state, clock, PAGE, null, inputs, (op) => state.apply(op));
+  return { state, ids };
+}
+
+const text = (state: MemoryState, id: string) => unitsText(readText(state, state.getBlock(id)!).units);
+const pageText = (state: MemoryState) =>
+  docBlocks(state, PAGE)
+    .filter((b) => b.text)
+    .map((b) => text(state, b.id));
+
+/** A tiny in-memory deployment: one server, several clients with replicas. */
+class Net {
+  server = new MemoryState();
+  clients: Client[] = [];
+  constructor(inputs: BlockInput[] = [{ type: "paragraph", properties: { rich_text: [{ text: "Hello" }] } }]) {
+    this.server.putBlock(pageBlock());
+    const clock = new Clock("seed");
+    createBlocks(this.server, clock, PAGE, null, inputs, (op) => this.server.apply(op));
+  }
+  client(name: string) {
+    const c = new Client(this, name);
+    c.catchUp();
+    this.clients.push(c);
+    return c;
+  }
+  broadcast(commit: Commit) {
+    for (const c of this.clients) if (c.online) c.inbox.push(commit);
+  }
+}
+
+class Client {
+  replica: Replica;
+  clock: Clock;
+  online = true;
+  inbox: Commit[] = [];
+  private sent = new Set<string>();
+  private seq = 0;
+  constructor(
+    private net: Net,
+    readonly name: string,
+  ) {
+    this.replica = new Replica(name);
+    this.clock = new Clock(name);
+  }
+  get view() {
+    return this.replica.view;
+  }
+  /** Make ops against the view (applied as made) and queue them as one transaction. */
+  edit(make: (view: MemoryState, apply: (op: RecordOp) => void) => void) {
+    const ops: RecordOp[] = [];
+    make(this.view, (op) => {
+      this.view.apply(op);
+      ops.push(op);
+    });
+    const tx: Transaction = { id: `${this.name}-${++this.seq}`, ops };
+    this.replica.local(tx);
+    return tx;
+  }
+  /** Send pending transactions in order (the server commits and broadcasts each). */
+  flush() {
+    if (!this.online) return;
+    for (const tx of [...this.replica.pending]) {
+      if (this.sent.has(tx.id)) continue;
+      this.sent.add(tx.id);
+      this.net.broadcast(commitTransaction(this.net.server, tx, { session: this.name, userId: this.name }));
+    }
+  }
+  deliver() {
+    if (!this.online) return;
+    const batch = this.inbox;
+    this.inbox = [];
+    for (const c of batch) this.replica.receive(c);
+  }
+  /** Reload from the server (page load, or after being offline). */
+  catchUp() {
+    const records = [...this.net.server.blocks.values()];
+    const instances = [...this.net.server.instances.values()].map((i) => ({ id: i.id, ops: i.ops() }));
+    this.replica.load(records, instances);
+  }
+  goOffline() {
+    this.online = false;
+    this.inbox = [];
+  }
+  goOnline() {
+    this.online = true;
+    this.catchUp();
+    // Unconfirmed transactions are re-sent: the server applies each exactly once.
+    this.sent.clear();
+    this.flush();
+  }
+}
+
+function settle(net: Net) {
+  for (let round = 0; round < 5; round++) {
+    for (const c of net.clients) c.flush();
+    for (const c of net.clients) c.deliver();
+  }
+}
+
+const docJSON = (state: MemoryState) => JSON.stringify(toPM(state, PAGE, { title: true }));
+
+// ---------------------------------------------------------------- the text CRDT
+
+describe("text CRDT (RGA)", () => {
+  const ins = (inst: TextInstance, session: string, origin: string | null, s: string) => {
+    const op: TextOp = { t: "ins", id: `${session}@${inst.maxClock + 1}`, origin, value: s.split("") };
+    inst.apply([op]);
+    return op;
+  };
+  const str = (inst: TextInstance) => unitsText(inst.read(0, inst.order().length).units);
+  const lastId = (inst: TextInstance) => inst.order()[inst.order().length - 1]!;
+
+  it("merges Notion's example: two people insert at different spots", () => {
+    const a = new TextInstance("t");
+    ins(a, "S", null, "Build things");
+    const b = a.clone();
+    const build = a.order()[4]!; // "d"
+    const opA = ins(a, "E", build, " cool");
+    const opB = ins(b, "C", lastId(b), " quickly");
+    a.apply([opB]);
+    b.apply([opA]);
+    expect(str(a)).toBe("Build cool things quickly");
+    expect(str(b)).toBe(str(a));
+  });
+
+  it("keeps concurrent runs at the same spot together (no interleaving)", () => {
+    const a = new TextInstance("t");
+    ins(a, "S", null, "ab");
+    const b = a.clone();
+    const after = a.order()[0]!;
+    const x = ins(a, "A", after, "XXX");
+    const y = ins(b, "B", after, "YYY");
+    a.apply([y]);
+    b.apply([x]);
+    expect(str(a)).toBe(str(b));
+    expect(["aXXXYYYb", "aYYYXXXb"]).toContain(str(a));
+  });
+
+  it("buffers ops that arrive before what they reference", () => {
+    const a = new TextInstance("t");
+    const first = ins(a, "A", null, "x");
+    const second = ins(a, "A", lastId(a), "y");
+    const b = new TextInstance("t");
+    b.apply([second]);
+    expect(str(b)).toBe("");
+    b.apply([first]);
+    expect(str(b)).toBe("xy");
+  });
+
+  it("delete keeps a tombstone that later inserts can anchor to", () => {
+    const a = new TextInstance("t");
+    ins(a, "A", null, "abc");
+    const b = a.clone();
+    const bId = a.order()[1]!;
+    a.apply([{ t: "vis", id: "A@10", targets: [bId], visible: false }]);
+    const y = ins(b, "B", bId, "!");
+    a.apply([y]);
+    expect(str(a)).toBe("a!c");
+  });
+
+  it("Peritext marks: concurrent bold and italic both apply; bold extends, links don't", () => {
+    const state = seeded([{ type: "paragraph", properties: { rich_text: [{ text: "Hello world" }] } }]).state;
+    const id = docBlocks(state, PAGE)[0]!.id;
+    const c1 = new Clock("A");
+    const c2 = new Clock("B");
+    for (const op of markOps(state, c1, state.getBlock(id)!, 0, 5, "bold", true)) state.apply(op);
+    for (const op of markOps(state, c2, state.getBlock(id)!, 3, 8, "italic", true)) state.apply(op);
+    const rich = state.getBlock(id)!.properties.rich_text;
+    expect(rich).toEqual([
+      { text: "Hel", marks: { bold: true } },
+      { text: "lo", marks: { bold: true, italic: true } },
+      { text: " wo", marks: { italic: true } },
+      { text: "rld" },
+    ]);
+    // Typing right after "Hello" (bold) is bold too; after a link it is not.
+    state.apply(insertOps(state, c1, state.getBlock(id)!, 5, ["!"])!);
+    for (const op of markOps(state, c1, state.getBlock(id)!, 7, 12, "link", "https://x.y")) state.apply(op);
+    state.apply(insertOps(state, c1, state.getBlock(id)!, 12, ["?"])!);
+    const runs = state.getBlock(id)!.properties.rich_text as Array<{ text: string; marks?: any }>;
+    expect(runs.find((r) => r.text.includes("!"))?.marks?.bold).toBe(true);
+    expect(runs.find((r) => r.text.includes("?"))?.marks?.link).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------- slices: split and merge
+
+describe("text instances and slices", () => {
+  it("split: someone typing in the tail at the same time lands in the new block", () => {
+    const net = new Net([{ type: "paragraph", properties: { rich_text: [{ text: "Hello wonderful world" }] } }]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const id = docBlocks(net.server, PAGE)[0]!.id;
+    // Alice presses Enter before "world"; Bob (offline) types inside "world".
+    bob.goOffline();
+    alice.edit((v, apply) => {
+      const t = readText(v, v.getBlock(id)!);
+      apply({ op: "split", id, at: t.ids[16]!, newId: "B2", newInstance: "B2", type: "paragraph", properties: {} });
+    });
+    bob.edit((v, apply) => apply(insertOps(v, bob.clock, v.getBlock(id)!, 18, ["~"])!));
+    settle(net);
+    bob.goOnline();
+    settle(net);
+    expect(pageText(net.server)).toEqual(["Hello wonderful ", "wo~rld"]);
+    for (const c of [alice, bob]) expect(docJSON(c.view)).toBe(docJSON(net.server));
+  });
+
+  it("merge: text typed into the merged-away block isn't lost", () => {
+    const net = new Net([
+      { type: "paragraph", properties: { rich_text: [{ text: "First" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "Second" }] } },
+    ]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const [a, b] = docBlocks(net.server, PAGE).map((x) => x.id);
+    bob.goOffline();
+    alice.edit((_v, apply) => apply({ op: "merge", into: a!, from: b! }));
+    bob.edit((v, apply) => apply(insertOps(v, bob.clock, v.getBlock(b!)!, 6, ["!"])!));
+    settle(net);
+    bob.goOnline();
+    settle(net);
+    expect(pageText(net.server)).toEqual(["FirstSecond!"]);
+    for (const c of [alice, bob]) expect(docJSON(c.view)).toBe(docJSON(net.server));
+  });
+
+  it("concurrent splits of the same block both take effect", () => {
+    const net = new Net([{ type: "paragraph", properties: { rich_text: [{ text: "one two three" }] } }]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const id = docBlocks(net.server, PAGE)[0]!.id;
+    const ids = readText(net.server, net.server.getBlock(id)!).ids;
+    alice.edit((_v, apply) => apply({ op: "split", id, at: ids[4]!, newId: "A2", newInstance: "A2", type: "paragraph", properties: {} }));
+    bob.edit((_v, apply) => apply({ op: "split", id, at: ids[8]!, newId: "B2", newInstance: "B2", type: "paragraph", properties: {} }));
+    settle(net);
+    expect(pageText(net.server)).toEqual(["one ", "two ", "three"]);
+    for (const c of [alice, bob]) expect(docJSON(c.view)).toBe(docJSON(net.server));
+  });
+
+  it("transactions that reach the server out of order still reach everyone (held ops are broadcast when released)", () => {
+    const net = new Net([{ type: "paragraph", properties: { rich_text: [{ text: "Hi" }] } }]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const id = docBlocks(net.server, PAGE)[0]!.id;
+    // Alice types three keystrokes offline: three transactions, each after the last.
+    alice.goOffline();
+    const txs = ["!", "?", "."].map((ch, i) => alice.edit((v, apply) => apply(insertOps(v, alice.clock, v.getBlock(id)!, 2 + i, [ch])!)));
+    // They reach the server newest first; Bob only sees broadcasts.
+    for (const tx of [...txs].reverse()) net.broadcast(commitTransaction(net.server, tx, { session: "alice", userId: "alice" }));
+    bob.deliver();
+    expect(pageText(net.server)).toEqual(["Hi!?."]);
+    expect(pageText(bob.view)).toEqual(["Hi!?."]);
+  });
+
+  it("delete wins over a concurrent edit inside the deleted block", () => {
+    const net = new Net([
+      { type: "paragraph", properties: { rich_text: [{ text: "Keep" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "Drop" }] } },
+    ]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const drop = docBlocks(net.server, PAGE)[1]!.id;
+    alice.edit((_v, apply) => apply({ op: "delete", id: drop }));
+    bob.edit((v, apply) => apply(insertOps(v, bob.clock, v.getBlock(drop)!, 4, ["?"])!));
+    settle(net);
+    expect(pageText(net.server)).toEqual(["Keep"]);
+    for (const c of [alice, bob]) expect(docJSON(c.view)).toBe(docJSON(net.server));
+  });
+
+  it("moving a block keeps a concurrent edit inside it", () => {
+    const net = new Net([
+      { type: "paragraph", properties: { rich_text: [{ text: "A" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "B" }] } },
+    ]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const [a, b] = docBlocks(net.server, PAGE).map((x) => x.id);
+    alice.edit((_v, apply) => apply({ op: "move", id: a!, parent: PAGE, after: b! }));
+    bob.edit((v, apply) => apply(insertOps(v, bob.clock, v.getBlock(a!)!, 1, ["!"])!));
+    settle(net);
+    expect(pageText(net.server)).toEqual(["B", "A!"]);
+  });
+});
+
+// ---------------------------------------------------------------- editor bridge
+
+const RICH: BlockInput[] = [
+  { type: "heading_1", properties: { rich_text: [{ text: "Title" }] } },
+  { type: "paragraph", properties: { rich_text: [{ text: "Hello " }, { text: "bold", marks: { bold: true } }, { text: " and " }, { text: "link", marks: { link: "https://a.b" } }] } },
+  { type: "paragraph", properties: { rich_text: [{ text: "Ping " }, { text: "@Bob", mention: { type: "user", id: "u1" } }, { text: " now" }] } },
+  { type: "bulleted_list_item", properties: { rich_text: [{ text: "one" }] }, children: [{ type: "bulleted_list_item", properties: { rich_text: [{ text: "nested" }] } }] },
+  { type: "bulleted_list_item", properties: { rich_text: [{ text: "two" }] } },
+  { type: "to_do", properties: { rich_text: [{ text: "task" }], checked: true } },
+  { type: "toggle", properties: { rich_text: [{ text: "toggle" }] }, children: [{ type: "paragraph", properties: { rich_text: [{ text: "inside" }] } }] },
+  { type: "quote", properties: { rich_text: [{ text: "quoted" }] } },
+  { type: "callout", properties: { rich_text: [{ text: "note" }], icon: "⚠️" } },
+  { type: "code", properties: { rich_text: [{ text: "let x = 1;\nx++" }], language: "typescript" } },
+  { type: "divider" },
+  { type: "paragraph", properties: { rich_text: [{ text: "parent" }] }, children: [{ type: "paragraph", properties: { rich_text: [{ text: "child" }] } }] },
+  {
+    type: "column_list",
+    children: [
+      { type: "column", children: [{ type: "paragraph", properties: { rich_text: [{ text: "left" }] } }] },
+      { type: "column", properties: { width: 2 }, children: [{ type: "paragraph", properties: { rich_text: [{ text: "right" }] } }] },
+    ],
+  },
+  { type: "image", properties: { url: "https://img", caption: "pic" } },
+];
+
+function edit(doc: PMNode, fn: (doc: PMNode) => void): PMNode {
+  const copy = JSON.parse(JSON.stringify(doc));
+  fn(copy);
+  return copy;
+}
+
+describe("editor bridge", () => {
+  it("records -> editor doc -> records is a fixed point (no ops)", () => {
+    const { state } = seeded(RICH);
+    const doc = toPM(state, PAGE, { title: true });
+    const ops: RecordOp[] = [];
+    commitDesired(state, new Clock("x"), fromPM(doc, PAGE), (op) => (state.apply(op), ops.push(op)));
+    expect(ops).toEqual([]);
+    expect(JSON.stringify(toPM(state, PAGE, { title: true }))).toBe(JSON.stringify(doc));
+  });
+
+  it("Enter in the middle of a paragraph becomes a split; Backspace becomes a merge", () => {
+    const { state } = seeded([{ type: "paragraph", properties: { rich_text: [{ text: "Hello world" }] } }]);
+    const doc = toPM(state, PAGE, { title: true });
+    const id = doc.content![1]!.attrs!.blockId;
+    const split = edit(doc, (d) => {
+      d.content!.splice(1, 1, { type: "paragraph", attrs: { blockId: id }, content: [{ type: "text", text: "Hello " }] }, { type: "paragraph", attrs: { blockId: "N" }, content: [{ type: "text", text: "world" }] });
+    });
+    const ops: RecordOp[] = [];
+    const clock = new Clock("x");
+    commitDesired(state, clock, fromPM(split, PAGE), (op) => (state.apply(op), ops.push(op)));
+    expect(ops.map((o) => o.op)).toEqual(["split"]);
+    expect(pageText(state)).toEqual(["Hello ", "world"]);
+
+    const merged = edit(toPM(state, PAGE, { title: true }), (d) => {
+      d.content!.splice(1, 2, { type: "paragraph", attrs: { blockId: id }, content: [{ type: "text", text: "Hello world" }] });
+    });
+    const ops2: RecordOp[] = [];
+    commitDesired(state, clock, fromPM(merged, PAGE), (op) => (state.apply(op), ops2.push(op)));
+    expect(ops2.map((o) => o.op)).toEqual(["merge"]);
+    expect(pageText(state)).toEqual(["Hello world"]);
+  });
+
+  it("typing, turning into a heading, indenting and deleting", () => {
+    const { state } = seeded([
+      { type: "paragraph", properties: { rich_text: [{ text: "a" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "b" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "c" }] } },
+    ]);
+    const doc = toPM(state, PAGE, { title: true });
+    const [a, b, c] = doc.content!.slice(1);
+    const next = edit(doc, (d) => {
+      d.content = [
+        { type: "title", content: [{ type: "text", text: "My page" }] },
+        { type: "heading", attrs: { blockId: a!.attrs!.blockId, level: 2 }, content: [{ type: "text", text: "a!" }] },
+        { type: "nest", content: [b!, c!] },
+      ];
+    });
+    commitDesired(state, new Clock("x"), fromPM(next, PAGE), (op) => state.apply(op));
+    expect(state.getBlock(PAGE)!.properties.title).toBe("My page");
+    expect(state.getBlock(a!.attrs!.blockId)!.type).toBe("heading_2");
+    expect(state.getBlock(b!.attrs!.blockId)!.content).toEqual([c!.attrs!.blockId]);
+    expect(JSON.stringify(toPM(state, PAGE, { title: true }))).toBe(JSON.stringify(next));
+  });
+});
+
+// ---------------------------------------------------------------- undo
+
+describe("undo", () => {
+  it("inverse ops revert only my change, after someone else's edit", () => {
+    const net = new Net([{ type: "paragraph", properties: { rich_text: [{ text: "Hi" }] } }]);
+    const alice = net.client("alice");
+    const bob = net.client("bob");
+    const id = docBlocks(net.server, PAGE)[0]!.id;
+    const inverse: RecordOp[] = [];
+    alice.edit((v, apply) => {
+      const op = insertOps(v, alice.clock, v.getBlock(id)!, 2, [..." Alice"])!;
+      inverse.push(...v.apply(op).inverse);
+      v.apply(op); // idempotent: already applied
+      apply(op);
+    });
+    settle(net);
+    bob.edit((v, apply) => apply(insertOps(v, bob.clock, v.getBlock(id)!, 0, [..."Bob: "])!));
+    settle(net);
+    alice.edit((v, apply) => {
+      for (const op of stampInverse(v, alice.clock, inverse)) apply(op);
+    });
+    settle(net);
+    expect(pageText(net.server)).toEqual(["Bob: Hi"]);
+  });
+
+  it("undoing a delete, a split and a move restores the structure", () => {
+    const { state } = seeded([
+      { type: "paragraph", properties: { rich_text: [{ text: "one two" }] } },
+      { type: "paragraph", properties: { rich_text: [{ text: "three" }] } },
+    ]);
+    const [a, b] = docBlocks(state, PAGE).map((x) => x.id);
+    const before = docJSON(state);
+    const clock = new Clock("u");
+    const inv: RecordOp[][] = [];
+    const run = (op: RecordOp) => inv.push(state.apply(op).inverse);
+    run({ op: "split", id: a!, at: readText(state, state.getBlock(a!)!).ids[4]!, newId: "S", newInstance: "S", type: "paragraph", properties: {} });
+    run({ op: "move", id: b!, parent: PAGE, after: null });
+    run({ op: "delete", id: "S" });
+    for (const ops of inv.reverse()) for (const op of stampInverse(state, clock, ops)) state.apply(op);
+    expect(docJSON(state)).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------- convergence fuzz
+
+function rng(seed: number) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 2 ** 32;
+  };
+}
+
+describe("convergence under random concurrent and offline edits", () => {
+  // FUZZ=300 pnpm test runs 300 seeds (the default 8 keep the suite fast).
+  const seeds = Array.from({ length: Number(process.env.FUZZ ?? 8) }, (_, i) => i + 1);
+  const steps = Number(process.env.FUZZ_STEPS ?? 300);
+  for (const seed of seeds) {
+    it(`seed ${seed}: every replica ends identical to the server`, () => {
+      const rand = rng(seed);
+      const pick = <T,>(xs: T[]) => xs[Math.floor(rand() * xs.length)]!;
+      const net = new Net([
+        { type: "paragraph", properties: { rich_text: [{ text: "alpha" }] } },
+        { type: "paragraph", properties: { rich_text: [{ text: "beta" }] } },
+        { type: "bulleted_list_item", properties: { rich_text: [{ text: "gamma" }] } },
+      ]);
+      const clients = ["a", "b", "c"].map((n) => net.client(n));
+      let fresh = 0;
+
+      for (let step = 0; step < steps; step++) {
+        const c = pick(clients);
+        const r = rand();
+        if (r < 0.04) {
+          if (c.online) c.goOffline();
+          else c.goOnline();
+          continue;
+        }
+        if (r < 0.25) {
+          c.flush();
+          c.deliver();
+          continue;
+        }
+        const blocks = docBlocks(c.view, PAGE).filter((b) => b.text);
+        if (!blocks.length) continue;
+        const b = pick(blocks);
+        const len = readText(c.view, b).units.length;
+        c.edit((v, apply) => {
+          const kind = rand();
+          if (kind < 0.45) {
+            const op = insertOps(v, c.clock, v.getBlock(b.id)!, Math.floor(rand() * (len + 1)), [..."xyz".slice(0, 1 + Math.floor(rand() * 3))]);
+            if (op) apply(op);
+          } else if (kind < 0.6 && len) {
+            const from = Math.floor(rand() * len);
+            for (const op of deleteOps(v, c.clock, v.getBlock(b.id)!, from, Math.min(len, from + 1 + Math.floor(rand() * 3)))) apply(op);
+          } else if (kind < 0.68 && len) {
+            const from = Math.floor(rand() * len);
+            for (const op of markOps(v, c.clock, v.getBlock(b.id)!, from, Math.min(len, from + 2), pick(["bold", "italic"]), rand() < 0.7 ? true : null)) apply(op);
+          } else if (kind < 0.78 && len > 1) {
+            const t = readText(v, v.getBlock(b.id)!);
+            const id = `n${++fresh}${c.name}`;
+            apply({ op: "split", id: b.id, at: t.ids[1 + Math.floor(rand() * (len - 1))]!, newId: id, newInstance: id, type: "paragraph", properties: {} });
+          } else if (kind < 0.84) {
+            const list = docBlocks(v, PAGE).filter((x) => x.text && x.parent_id === b.parent_id);
+            const i = list.findIndex((x) => x.id === b.id);
+            if (i > 0) apply({ op: "merge", into: list[i - 1]!.id, from: b.id });
+          } else if (kind < 0.9) {
+            const id = `n${++fresh}${c.name}`;
+            apply({ op: "create", id, type: "paragraph", parent: PAGE, after: pick([null, ...v.getBlock(PAGE)!.content]), properties: {}, text: null });
+            const op = insertOps(v, c.clock, v.getBlock(id)!, 0, ["n", "e", "w"]);
+            if (op) apply(op);
+          } else if (kind < 0.95) {
+            apply({ op: "move", id: b.id, parent: PAGE, after: pick([null, ...v.getBlock(PAGE)!.content.filter((x) => x !== b.id)]) });
+          } else if (blocks.length > 1) {
+            apply({ op: "delete", id: b.id });
+          }
+        });
+      }
+
+      for (const c of clients) if (!c.online) c.goOnline();
+      settle(net);
+      for (const c of clients) c.catchUp();
+      const truth = docJSON(net.server);
+      for (const c of clients) {
+        expect(c.replica.pending).toEqual([]);
+        expect(pageText(c.view)).toEqual(pageText(net.server));
+        expect(docJSON(c.view)).toBe(truth);
+      }
+    });
+  }
+});

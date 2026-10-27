@@ -10,9 +10,9 @@ has to make, and is honest about where it takes shortcuts.
 1. **The block model is the shape of the data.** Pages, databases, rows and paragraphs are all
    blocks with `type`, `properties`, `parent_id` and an ordered `content` array. The REST API,
    search, export, history previews and permissions all read this model.
-2. **Collaboration that really converges.** Concurrent edits from any number of tabs merge to
-   the same bytes, offline edits survive a reload and merge on reconnect, and you can see who
-   is on the page and where they're typing.
+2. **Collaboration that really converges, built the way Notion builds it.** Concurrent edits
+   from any number of tabs converge, offline edits survive a reload and merge on reconnect, and
+   you can see who is on the page and where they're typing.
 3. **It feels like Notion where it matters for a demo**: slash menu, markdown shortcuts,
    drag handles, toggles, callouts, the sidebar tree, inline databases with a board view.
 4. **It runs anywhere Node 22.13+ runs**: `pnpm install && pnpm dev`, with no Docker, database
@@ -33,55 +33,60 @@ README's limitations.
 
 | Decision | Why | Cost |
 | --- | --- | --- |
-| Yjs CRDT per page for rich text | Character-level merge, offline, and per-user undo for free. The server is a relay plus storage. | Projection lag (~300 ms), CRDT metadata, "delete wins" semantics |
-| Block table as a projection of the doc | Keeps a queryable Notion-shaped model without building an OT engine | Two representations, so every server write must go through the doc (enforced via `DocManager.mutate`) |
-| Server-ordered ops for structure and databases | Cells are atomic values. Ordering on the server gives intuitive LWW and simple validation | No offline edits for structure (needs the server) |
-| Title stored inside the page doc | Renames merge like any text and the sidebar updates from the projection | Renaming from the sidebar has to load the doc |
-| Own y-websocket server | Control over auth, read-only enforcement, the persistence hooks and presence cleanup | ~200 lines to own |
-| Append-only update log + debounced compaction | No lost keystrokes on crash, cheap writes, compact storage | Two tables to reason about |
+| Notion's sync design, built from its engineering blog (no Yjs) | Records + server-ordered transactions give structure clear semantics, per-op permission checks and moves that can't lose edits; a CRDT only for text keeps character-level merging and offline typing | I own the engine: a text CRDT, the rebase, the editor bridge, and their tests (see docs/SYNC.md) |
+| Text CRDT = RGA with Notion's ordering rule + Peritext marks | Ids `session@clock`, same-origin newest first, tombstones; marks with anchors so bold extends and links don't | Tombstones aren't garbage-collected |
+| Text instances and slices | Enter/Backspace move ranges of a shared instance, so concurrent typing follows the text into the right block | A block split many times reads several slices |
+| Block table is the source of truth | No projection step: REST, search, export and the AI read the same records the editor edits | Derived text (`rich_text`, `title`) is recomputed on every commit |
+| Optimistic client + rebase | Edits show instantly; pending ops are re-applied on top of every confirmed commit, so the server's order wins | The view is rebuilt per commit (cheap at page scale) |
+| TransactionQueue + RecordCache in IndexedDB | Offline edits (structure included) survive reloads and send on reconnect; kept pages open offline | Two client stores to keep consistent |
+| Record versions | Out-of-order updates (my HTTP ack vs someone's later commit) keep the newest copy | A column bumped on every write |
+| Push committed records instead of version pings | One fewer round trip per remote keystroke than Notion's fetch-on-version | Larger socket messages |
 | SQLite (WAL) via `node:sqlite` | Zero setup, transactional, FTS5 built in | One writer process |
-| TipTap (ProseMirror) with custom nodes | A mature editor core and y-prosemirror binding, so effort goes into the block model | Must map the editor schema to block types (lists, toggles) |
-| `blockId` attribute on every block node | Stable identity across edits, so the projection diff, comments on blocks and drag/move keep ids | Ids must be de-duplicated after split and paste (client and server both do it) |
+| TipTap (ProseMirror) with custom nodes | A mature editor core; the sync binding renders records into it and reads edits back | Must map the editor schema to block types (lists, toggles, nest) |
+| `blockId` attribute on every block node | Stable identity across edits, so diffs, comments on blocks and drag/move keep ids | Ids must be de-duplicated after split and paste |
 | Children of any block via a `nest` wrapper whose head is the block | ProseMirror text blocks can't hold blocks; this is the shape list items/toggles already use, and the head keeps its id | Another editor-vs-block-model mapping to maintain (round-trip tested) |
-| Lenient layout schemas, tidy only on local edits | y-prosemirror deletes elements that don't fit the schema on every client; strict rules would turn concurrent leftovers into data loss | Leftover wrappers can exist until the next local edit (harmless, the projection tolerates them) |
-| Synced block = its own Yjs document | "Edit once, show everywhere" stays exact and gets cursors/undo/offline for free | Nested editor per instance; page snapshots don't include it |
+| Lenient layout schemas, tidy only on local edits | Concurrent edits can leave any shape (one-column list, one-child nest); rendering must accept it | Leftover wrappers can exist until the next local edit |
+| Synced block = a container that owns its blocks | "Edit once, show everywhere" stays exact, with cursors and undo inside | Nested editor per instance; page snapshots don't include it |
 | Two-way relations mirrored in one server transaction | Cells are server-ordered, so both sides stay consistent | Relation edits need the server (no offline database edits) |
 | Formula language: Pratt parser + evaluator, no `eval` | Expressions come from any member and run in every browser | A subset of Notion's language |
-| AI edits as Yjs transactions with a per-run origin | It's a real collaborator (presence, live typing), and a per-origin `Y.UndoManager` makes Discard exact even with concurrent human edits | The run's doc stays in memory until it's kept or discarded (15 min cap) |
+| AI edits as commits from its own session, with inverses kept per run | It's a real collaborator (presence, live typing), and Discard applies the run's inverse ops: exact even with concurrent human edits, and it keeps blocks people typed into | The undo history stays in memory until kept or discarded (15 min cap) |
 | Split deploy + HMAC WebSocket tickets | Next.js on a serverless host can't hold WebSockets; tickets fix the cross-site cookie problem | Two deploy targets instead of one |
 
 ## Architecture
 
 ```
-Browser (Next.js :3000)                              Leaf server (:4000)
-┌──────────────────────────────┐   /ws/doc/:id    ┌───────────────────────────────────────────┐
-│ TipTap + y-prosemirror        │◄──────────────►│ sync + awareness ─► DocManager             │
-│ Y.Doc  ◄──► IndexedDB replica │  binary Yjs    │   live Y.Docs ─► yupdates (append)          │
-│                               │                │              ─► ydocs (compact, 1s)         │
-│ Workspace store (pages, DBs)  │◄── /ws/events ─│              ─► blocks + FTS (project, 300ms)│
-│                               │    JSON        │ Hub (structure events)                      │
-│ fetch /api/* (proxied by Next)│───────────────►│ REST ─► app services ─► SQLite transactions │
-└──────────────────────────────┘                └───────────────────────────────────────────┘
+Browser (Next.js :3000)                                Leaf server (:4000)
+┌───────────────────────────────────┐ saveTransactions ┌──────────────────────────────────────────┐
+│ TipTap + sync binding (toPM/fromPM)│ ───────────────► │ SyncService: check · apply · version     │
+│ Sync client: confirmed + pending   │ loadPageChunk    │   blocks + text_instances (SQLite)        │
+│   TransactionQueue  (IndexedDB)    │ ◄─────────────── │   ─► FTS index, snapshots (debounced)     │
+│   RecordCache       (IndexedDB)    │                  │                                          │
+│ Workspace store (sidebar)          │ ◄── /ws/events ──│ Hub (MessageStore): commits, presence,   │
+│                                    │   JSON           │   sidebar events                          │
+│ fetch /api/* (proxied by Next)     │ ───────────────► │ REST ─► app services ─► sync edits        │
+└───────────────────────────────────┘                  └──────────────────────────────────────────┘
 ```
 
 ## Data flow examples
 
-- **Typing**: keystroke → ProseMirror transaction → y-prosemirror → Yjs update → WebSocket →
-  server applies it, logs it, rebroadcasts → other clients render it. 300 ms later the projection
-  updates `blocks` and the search index.
-- **New sub-page from the sidebar**: `POST /api/pages` → insert page block → build its doc → append
-  a page-link node to the parent's doc (a Yjs transaction, so open editors see it) → project →
-  publish the page block on the Hub → every sidebar shows it.
+- **Typing**: keystroke → ProseMirror transaction → `fromPM` + `commitDesired` → a `text` op
+  applied to the view and queued → `saveTransactions` → the server checks, applies, bumps versions
+  → the commit is broadcast → other clients apply it and re-render.
+- **Enter in the middle of a paragraph**: recognised as a `split`. The new block takes the tail of
+  the same text instance, so concurrent typing in the tail lands in it.
+- **New sub-page from the sidebar**: `POST /api/pages` → insert the page record → a server edit
+  writes its title, body and a `move` into the parent's content → the commit reaches open editors
+  and every sidebar.
 - **Board drag**: `PATCH /api/rows/:id` (status) + a `moveRow` op → SQLite transaction → Hub →
   all clients re-group.
-- **Restore a version**: snapshot "Before restore" → replace the live fragment with a deep copy
-  of the snapshot (a forward edit) → clients receive it → projection.
+- **Restore a version**: snapshot "Before restore" → render the version as an editor document and
+  commit it as the desired state (the same path an edit takes) → clients receive it.
 
 ## Milestones (as built)
 
-1. Shared block model: types, Y ↔ blocks conversion, database logic, Markdown. Unit tests. ✅
-2. Server: schema, auth, pages and the tree, REST over blocks, DocManager (log, compaction,
-   projection), WebSocket sync with auth and read-only, Hub. API and convergence tests. ✅
+1. Shared block model: types, database logic, Markdown. Unit tests. ✅
+2. Server: schema, auth, pages and the tree, REST over blocks, real-time sync (first on Yjs),
+   Hub. API and convergence tests. ✅
 3. Seed data: two users, sample pages, an inline database, comments, a version. ✅
 4. Web: auth, sidebar tree, editor with custom nodes, slash menu, toolbar, drag handle, block
    menu, mentions, presence. ✅
@@ -96,6 +101,12 @@ Browser (Next.js :3000)                              Leaf server (:4000)
     database editing, a deterministic mock model for tests. ✅
 11. Deployment: WebSocket tickets, guest sandboxes with invite links and expiry sweep, Docker
     image, Fly/Caddy configs, cross-site e2e. ✅
+12. Offline mode: service worker shell, background page downloads, offline status. ✅
+13. **Own sync engine, after Notion's engineering blog**, replacing Yjs: records + transactions
+    (`saveTransactions`, `loadPageChunk`, MessageStore, versions), an RGA text CRDT with
+    Peritext marks, text instances and slices for split/merge, an optimistic client with rebase,
+    TransactionQueue + RecordCache in IndexedDB, offline reasons, the editor bridge, presence and
+    undo. Convergence simulation (1,000 seeds), network tests, e2e. See docs/SYNC.md. ✅
 
 ## What I'd do next
 
@@ -105,9 +116,11 @@ Browser (Next.js :3000)                              Leaf server (:4000)
 - **Leaf AI**: stream tokens straight into the document (today text arrives per tool call),
   comments-as-prompts ("@Leaf AI rewrite this"), AI-filled database columns that re-run when
   their inputs change, and evals on a fixed set of editing tasks.
-- **Snapshots**: `Y.snapshot` + update log instead of full states, pruning by age, visual diffs.
+- **Sync engine**: garbage-collect tombstones once every client has seen a delete; Notion's
+  search labels for slices if structure ever stops being server-ordered; a binary encoding for
+  ops (Notion reports 5× smaller storage).
+- **Snapshots**: deltas instead of full states, pruning by age, visual diffs.
 - **Permissions**: per-page ACL inheritance checked at REST and socket layers, plus guests.
-- **Editor**: comments anchored to text ranges (Y.RelativePosition), file uploads, and moves that
-  preserve concurrent edits inside the moved block (a move op instead of delete + insert).
-- **Databases**: timeline view, OR filter groups, per-user view settings, CRDT-backed cells
+- **Editor**: comments anchored to text ranges (item anchors, like the caret), file uploads.
+- **Databases**: timeline view, OR filter groups, per-user view settings, CRDT-backed text cells
   for offline database edits.
