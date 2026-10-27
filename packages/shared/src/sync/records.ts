@@ -20,7 +20,7 @@
  * (`from: null`), so typing at offset 0 always has somewhere to go.
  */
 import type { Block, BlockType, RichText, RichTextRun, Slice } from "../types.js";
-import { EXTENDABLE, makeId, sameUnit, TextInstance, unitText, type Anchor, type MarkValue, type Piece, type TextOp, type Unit } from "./text.js";
+import { EXTENDABLE, makeId, sameUnit, TextInstance, unitText, type Anchor, type MarkValue, type TextOp, type Unit } from "./text.js";
 
 export type { Slice };
 
@@ -96,16 +96,22 @@ export interface Segment {
   slice: Slice;
   index: number;
   inst: TextInstance;
+  /** Positions [lo, hi) of the slice in its instance (tombstones included). */
   lo: number;
   hi: number;
-  piece: Piece;
+  /** Visible units in the slice. */
+  count: number;
 }
 
+/** A block's slices, measured (counts only: nothing is read). */
 export function segments(state: SyncState, block: Block): Segment[] {
   return (block.text ?? []).map((slice, index) => {
     const inst = state.instance(slice.i);
-    const [lo, hi] = inst.bounds(slice.from, slice.to);
-    return { slice, index, inst, lo, hi, piece: inst.read(lo, Math.max(lo, hi)) };
+    // The usual case (a block that was never split) is its whole instance: no lookups.
+    if (slice.from === null && slice.to === null) return { slice, index, inst, lo: 0, hi: inst.length, count: inst.visibleCount() };
+    const [lo, hi0] = inst.bounds(slice.from, slice.to);
+    const hi = Math.max(lo, hi0);
+    return { slice, index, inst, lo, hi, count: inst.visibleCount(lo, hi) };
   });
 }
 
@@ -115,17 +121,63 @@ export interface BlockTextView {
   marks: Record<string, true | string>[];
   /** Which segment each unit came from. */
   seg: number[];
+  /** Text + formatting as one string, to tell "unchanged" in one comparison (lazy). */
+  sig?: string;
 }
 
+/** A string that's equal for equal text and formatting. */
+export function textSig(units: Unit[], marks: Record<string, true | string>[]): string {
+  let text = "";
+  let fmt = "";
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i]!;
+    text += typeof u === "string" ? u : "\uFFFC" + JSON.stringify(u.mention);
+    const m = marks[i];
+    if (m) for (const _ in m) {
+      fmt += i + JSON.stringify(Object.entries(m).sort()) + ";";
+      break;
+    }
+  }
+  return text + "\u0000" + fmt;
+}
+
+const textCache = new WeakMap<SyncState, Map<string, { key: string; view: BlockTextView }>>();
+
+/** A block's visible text. Cached per block until its slices or instances change. */
 export function readText(state: SyncState, block: Block): BlockTextView {
+  const slices = block.text ?? [];
+  const key = JSON.stringify(slices) + "#" + slices.map((s) => state.instance(s.i).version).join(",");
+  let byBlock = textCache.get(state);
+  if (!byBlock) textCache.set(state, (byBlock = new Map()));
+  const hit = byBlock.get(block.id);
+  if (hit && hit.key === key) return hit.view;
   const out: BlockTextView = { ids: [], units: [], marks: [], seg: [] };
   segments(state, block).forEach((s, k) => {
-    out.ids.push(...s.piece.ids);
-    out.units.push(...s.piece.units);
-    out.marks.push(...s.piece.marks);
-    for (let n = 0; n < s.piece.ids.length; n++) out.seg.push(k);
+    const piece = s.inst.read(s.lo, s.hi);
+    for (let n = 0; n < piece.ids.length; n++) {
+      out.ids.push(piece.ids[n]!);
+      out.units.push(piece.units[n]!);
+      out.marks.push(piece.marks[n]!);
+      out.seg.push(k);
+    }
   });
+  byBlock.set(block.id, { key, view: out });
   return out;
+}
+
+/**
+ * The segment holding visible offset `offset` of a block, and the offset within it. An
+ * offset on a boundary belongs to the earlier segment (offset 0: the first).
+ */
+function locate(segs: Segment[], offset: number): { seg: Segment; k: number } {
+  let rest = offset;
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    if (rest <= s.count && (rest > 0 || i === 0)) return { seg: s, k: rest };
+    rest -= s.count;
+  }
+  const last = segs[segs.length - 1]!;
+  return { seg: last, k: last.count };
 }
 
 /** Leaf's rich text runs from units + marks. */
@@ -190,53 +242,53 @@ export function deriveText(state: SyncState, block: Block): Block {
 /**
  * Insert units at a visible offset of a block. Inside a slice, the new run goes right
  * after the unit before the caret. At a slice boundary it goes at the end of the slice
- * before (so it stays inside this block); offset 0 goes at the start of the first slice,
- * which is always the block's own instance from its beginning.
+ * before, after its last item (tombstones included), so it stays inside this block;
+ * offset 0 goes at the start of the first slice, which is always the block's own
+ * instance from its beginning. Where exactly in the tree is the instance's call (Fugue).
  */
 export function insertOps(state: SyncState, clock: Clock, block: Block, offset: number, units: Unit[]): RecordOp | null {
   if (!units.length) return null;
   const segs = segments(state, block);
   if (!segs.length) return null;
-  let rest = offset;
-  let target = segs[0]!;
-  let origin: string | null = null;
-  let found = false;
-  for (let k = 0; k < segs.length; k++) {
-    const s = segs[k]!;
-    const n = s.piece.ids.length;
-    if (rest <= n && (rest > 0 || k === 0)) {
-      target = s;
-      origin = rest > 0 ? s.piece.ids[rest - 1]! : null;
-      if (rest === 0) {
-        // Start of the first slice: after whatever precedes it (nothing, for an own slice).
-        origin = s.lo > 0 ? s.inst.order()[s.lo - 1]! : null;
-      } else if (rest === n) {
-        // End of the slice: after its last item, tombstones included, so the run lands
-        // before the slice's end boundary.
-        origin = s.hi > s.lo ? s.inst.order()[s.hi - 1]! : origin;
+  const { seg, k } = locate(segs, offset);
+  const { inst, lo, hi } = seg;
+  let after: string | null;
+  if (k > 0 && k < seg.count) after = inst.nthVisible(lo, k - 1)!;
+  else if (k > 0) after = inst.idAt(hi - 1)!;
+  else after = lo > 0 ? inst.idAt(lo - 1)! : null;
+  const { parent, side } = inst.placement(after);
+  const id = clock.stamp(inst, units.length);
+  return { op: "text", instance: inst.id, ops: [{ t: "ins", id, parent, side, value: units }] };
+}
+
+/** Visit the visible items at block offsets [from, to), per segment. */
+function eachRange(segs: Segment[], from: number, to: number, fn: (seg: Segment, ids: string[]) => void) {
+  let base = 0;
+  for (const seg of segs) {
+    if (to <= base) break;
+    const end = base + seg.count;
+    if (from < end && seg.count) {
+      const a = Math.max(from, base) - base;
+      const b = Math.min(to, end) - base;
+      const ids: string[] = [];
+      const first = seg.inst.nthVisible(seg.lo, a);
+      if (first) {
+        seg.inst.forEach(seg.inst.indexOf(first), seg.hi, (id, vis) => {
+          if (!vis) return;
+          ids.push(id);
+          if (ids.length === b - a) return false;
+        });
       }
-      found = true;
-      break;
+      if (ids.length) fn(seg, ids);
     }
-    rest -= n;
+    base = end;
   }
-  if (!found) {
-    target = segs[segs.length - 1]!;
-    origin = target.hi > target.lo ? target.inst.order()[target.hi - 1]! : target.lo > 0 ? target.inst.order()[target.lo - 1]! : null;
-  }
-  const id = clock.stamp(target.inst, units.length);
-  return { op: "text", instance: target.inst.id, ops: [{ t: "ins", id, origin, value: units }] };
 }
 
 /** Hide the units in [from, to) of a block. */
 export function deleteOps(state: SyncState, clock: Clock, block: Block, from: number, to: number): RecordOp[] {
-  const t = readText(state, block);
-  const segs = segments(state, block);
   const byInst = new Map<string, string[]>();
-  for (let i = from; i < to && i < t.ids.length; i++) {
-    const inst = segs[t.seg[i]!]!.inst.id;
-    byInst.set(inst, [...(byInst.get(inst) ?? []), t.ids[i]!]);
-  }
+  eachRange(segments(state, block), from, to, (seg, ids) => byInst.set(seg.inst.id, [...(byInst.get(seg.inst.id) ?? []), ...ids]));
   return [...byInst].map(([instance, targets]) => ({
     op: "text" as const,
     instance,
@@ -244,30 +296,22 @@ export function deleteOps(state: SyncState, clock: Clock, block: Block, from: nu
   }));
 }
 
-/** Set (value) or clear (null) a mark over [from, to) of a block, one op per instance. */
+/** Set (value) or clear (null) a mark over [from, to) of a block, one op per slice. */
 export function markOps(state: SyncState, clock: Clock, block: Block, from: number, to: number, mark: string, value: MarkValue): RecordOp[] {
   if (from >= to) return [];
-  const t = readText(state, block);
-  const segs = segments(state, block);
   const out: RecordOp[] = [];
-  let i = from;
-  while (i < to && i < t.ids.length) {
-    const k = t.seg[i]!;
-    let j = i;
-    while (j + 1 < to && j + 1 < t.ids.length && t.seg[j + 1] === k) j++;
-    const inst = segs[k]!.inst;
-    const first = t.ids[i]!;
-    const last = t.ids[j]!;
+  eachRange(segments(state, block), from, to, (seg, ids) => {
+    const inst = seg.inst;
+    const first = ids[0]!;
+    const last = ids[ids.length - 1]!;
     let end: Anchor | null;
     if (EXTENDABLE.has(mark) && value !== null) {
       // Grows with typing at its end: stop before the next item of the instance.
-      const order = inst.order();
-      const next = order[inst.indexOf(last) + 1];
+      const next = inst.idAt(inst.indexOf(last) + 1);
       end = next ? { item: next, side: "before" } : null;
     } else end = { item: last, side: "after" };
     out.push({ op: "text", instance: inst.id, ops: [{ t: "mark", id: clock.stamp(inst), mark, value, start: { item: first, side: "before" }, end }] });
-    i = j + 1;
-  }
+  });
   return out;
 }
 
@@ -286,6 +330,9 @@ export function setTextOps(
 ) {
   let block = state.getBlock(blockId)!;
   const cur = readText(state, block);
+  // Unchanged (most blocks, most keystrokes): one string comparison.
+  cur.sig ??= textSig(cur.units, cur.marks);
+  if (cur.units.length === units.length && cur.sig === textSig(units, marks)) return;
   let p = 0;
   while (p < cur.units.length && p < units.length && sameUnit(cur.units[p]!, units[p]!)) p++;
   let s = 0;
@@ -505,7 +552,7 @@ export function applyOp(state: SyncState, op: RecordOp): Applied {
       const inst = state.instance(op.instance);
       const prev = op.ops.map((t) => (t.t === "vis" ? t.targets.map((x) => [x, inst.has(x) ? inst.visible(x) : true] as const) : []));
       const before = op.ops.map((t) => (t.t === "mark" ? markRuns(inst, t) : []));
-      const applied = inst.apply(op.ops);
+      const applied = inst.apply(op.ops, state.now());
       if (!applied.length) return { changed, text, inverse, textApplied: [] };
       for (const id of state.blocksOfInstance(op.instance)) text.add(id);
       // Inverses: hide what was inserted, restore visibility, put marks back.
@@ -618,9 +665,8 @@ function findInstance(state: SyncState, host: Block | undefined, item: string): 
 /** Current values of a mark over the visible items an op covers, as runs (for undo). */
 function markRuns(inst: TextInstance, op: Extract<TextOp, { t: "mark" }>): Array<{ first: string; last: string; value: MarkValue }> {
   if ((op.start && !inst.has(op.start.item)) || (op.end && !inst.has(op.end.item))) return [];
-  const order = inst.order();
   const lo = op.start ? inst.indexOf(op.start.item) + (op.start.side === "after" ? 1 : 0) : 0;
-  const hi = op.end ? inst.indexOf(op.end.item) + (op.end.side === "after" ? 1 : 0) : order.length;
+  const hi = op.end ? inst.indexOf(op.end.item) + (op.end.side === "after" ? 1 : 0) : inst.length;
   const piece = inst.read(lo, hi);
   const runs: Array<{ first: string; last: string; value: MarkValue }> = [];
   piece.ids.forEach((id, n) => {

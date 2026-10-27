@@ -221,6 +221,7 @@ export class Leaf {
       tx(this.db, () => {
         // Every text instance is named after the block that created it.
         this.db.prepare("DELETE FROM text_instances WHERE id IN (SELECT id FROM blocks WHERE workspace_id = ?)").run(id);
+        this.db.prepare("DELETE FROM text_ops WHERE instance_id IN (SELECT id FROM blocks WHERE workspace_id = ?)").run(id);
         this.db.prepare("DELETE FROM block_instances WHERE block_id IN (SELECT id FROM blocks WHERE workspace_id = ?)").run(id);
         for (const p of pages) {
           this.db.prepare("DELETE FROM comments WHERE page_id = ?").run(p.id);
@@ -471,6 +472,7 @@ export class Leaf {
         if (b.type === "page") {
           this.sync.drop(b.id);
           this.db.prepare("DELETE FROM text_instances WHERE id IN (SELECT id FROM blocks WHERE page_id = ?)").run(b.id);
+          this.db.prepare("DELETE FROM text_ops WHERE instance_id IN (SELECT id FROM blocks WHERE page_id = ?) OR instance_id = ?").run(b.id, b.id);
           this.db.prepare("DELETE FROM block_instances WHERE block_id IN (SELECT id FROM blocks WHERE page_id = ?)").run(b.id);
           this.db.prepare("DELETE FROM blocks WHERE page_id = ?").run(b.id);
           this.db.prepare("DELETE FROM text_instances WHERE id = ?").run(b.id);

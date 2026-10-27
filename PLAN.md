@@ -34,7 +34,8 @@ README's limitations.
 | Decision | Why | Cost |
 | --- | --- | --- |
 | Notion's sync design, built from its engineering blog (no Yjs) | Records + server-ordered transactions give structure clear semantics, per-op permission checks and moves that can't lose edits; a CRDT only for text keeps character-level merging and offline typing | I own the engine: a text CRDT, the rebase, the editor bridge, and their tests (see docs/SYNC.md) |
-| Text CRDT = RGA with Notion's ordering rule + Peritext marks | Ids `session@clock`, same-origin newest first, tombstones; marks with anchors so bold extends and links don't | Tombstones aren't garbage-collected |
+| Text CRDT = RGA with Notion's ordering rule + the Fugue fix + Peritext marks | Ids `session@clock`, siblings newest first, tombstones; Fugue's left/right children so backwards typing doesn't interleave; marks with anchors so bold extends and links don't | Tombstone ids stay forever (content is collected after a day) |
+| Chunked order index + op log with compaction | O(√n) lookups: the editing trace (259,778 edits) runs in ~1 s, on par with Yjs; a keystroke appends, compaction folds and cleans up | JSON storage is ~1.5× Yjs's binary |
 | Text instances and slices | Enter/Backspace move ranges of a shared instance, so concurrent typing follows the text into the right block | A block split many times reads several slices |
 | Block table is the source of truth | No projection step: REST, search, export and the AI read the same records the editor edits | Derived text (`rich_text`, `title`) is recomputed on every commit |
 | Optimistic client + rebase | Edits show instantly; pending ops are re-applied on top of every confirmed commit, so the server's order wins | The view is rebuilt per commit (cheap at page scale) |
@@ -116,9 +117,9 @@ Browser (Next.js :3000)                                Leaf server (:4000)
 - **Leaf AI**: stream tokens straight into the document (today text arrives per tool call),
   comments-as-prompts ("@Leaf AI rewrite this"), AI-filled database columns that re-run when
   their inputs change, and evals on a fixed set of editing tasks.
-- **Sync engine**: garbage-collect tombstones once every client has seen a delete; Notion's
-  search labels for slices if structure ever stops being server-ordered; a binary encoding for
-  ops (Notion reports 5× smaller storage).
+- **Sync engine**: a binary encoding (Leaf's JSON is ~1.5× Yjs's size on the editing trace);
+  removing tombstone ids entirely once every replica has seen a delete; Notion's search labels
+  for slices if structure ever stops being server-ordered.
 - **Snapshots**: deltas instead of full states, pruning by age, visual diffs.
 - **Permissions**: per-page ACL inheritance checked at REST and socket layers, plus guests.
 - **Editor**: comments anchored to text ranges (item anchors, like the caret), file uploads.

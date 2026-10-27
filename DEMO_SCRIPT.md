@@ -111,15 +111,28 @@ whatever is still pending on top of every confirmed commit (a rebase). docs/SYNC
 piece to the posts.
 
 **Walk me through the text CRDT.**
-- **Ids and ordering.** Every character has an id, `session@clock` with a Lamport clock, and is
-  inserted after an "origin" character, so the text is a tree read in pre-order. Siblings with
-  the same origin sort newest first, with the session as tie-breaker. Every replica builds the
+- **Ids and ordering.** Every character has an id, `session@clock` with a Lamport clock, and
+  attaches to a neighbour in a tree (Fugue's left/right children), read in order. Siblings sort
+  newest first, with the session as tie-breaker, Notion's rule. Every replica builds the
   same tree in any delivery order, and two people typing at the same spot get two intact runs.
 - **Deletes and run-length.** Deletes leave tombstones, because offline edits may still point at
   a deleted character. A run typed in one go is one op with consecutive clocks.
 - **Formatting (Peritext).** A mark op has anchors on the before or after side of an item. Bold
   ends before the next character, so typing at its end stays bold. A link ends after its last
   character, so it doesn't grow. The newest op of each mark kind wins.
+
+**Is it fast? And what's the interleaving problem?**
+I benchmarked it on the standard text-CRDT test, automerge-perf's editing trace (every
+keystroke of a real paper, 259,778 edits). The first version was quadratic: about 40 minutes
+for the full trace. With a chunked order index, run-length storage and an append-only op log,
+it takes about a second, the same as Yjs on my machine. Yjs still wins on storage and memory
+(binary encoding).
+
+Interleaving is a known RGA flaw. Two people typing backwards at the same spot get their
+letters interleaved, because every insert goes after the same left neighbour. I used the fix from
+the Fugue paper (2023): when the character before the cursor already has text after it, the new
+character attaches to the left of the next one instead. Each person's run stays whole, and
+Notion's newest-first rule is unchanged.
 
 **What are text instances and slices, and why bother?**
 A block's text isn't its own CRDT. It's slices of a text instance.

@@ -36,6 +36,12 @@ import { HttpError, type BlockStore } from "./store.js";
 export interface SyncOptions {
   snapshotIntervalMs: number;
   indexDebounceMs: number;
+  /** Fold an instance's op log into its stored state after this many commits… */
+  compactAfterOps?: number;
+  /** …or after it has been idle this long. */
+  compactIdleMs?: number;
+  /** Tombstones hidden longer than this lose their content at compaction (default 24 h). */
+  tombstoneTtlMs?: number;
 }
 
 export interface EditContext {
@@ -82,6 +88,8 @@ export class SyncService {
   readonly session = `srv-${randomUUID().slice(0, 8)}`;
   readonly clock = new Clock(this.session);
   private instances = new Map<string, TextInstance>();
+  /** Instances with logged ops not yet compacted: how many commits, and the idle timer. */
+  private unsaved = new Map<string, { count: number; timer: NodeJS.Timeout | null }>();
   private indexTimers = new Map<string, NodeJS.Timeout>();
   private changedSinceSnapshot = new Map<string, string | null>();
 
@@ -102,18 +110,61 @@ export class SyncService {
       this.instances.set(id, t);
       return t;
     }
+    // Stored state, then the ops logged since it was written.
     const row = this.db.prepare("SELECT state FROM text_instances WHERE id = ?").get(id) as { state: string } | undefined;
     t = row ? TextInstance.fromJSON(JSON.parse(row.state) as TextInstanceJSON) : new TextInstance(id);
+    for (const r of this.db.prepare("SELECT ops, created_at FROM text_ops WHERE instance_id = ? ORDER BY seq").all(id) as Array<{ ops: string; created_at: number }>) {
+      t.apply(JSON.parse(r.ops), Number(r.created_at));
+    }
     this.instances.set(id, t);
-    if (this.instances.size > 20_000) this.instances.delete(this.instances.keys().next().value!);
+    if (this.instances.size > 20_000) {
+      const oldest = this.instances.keys().next().value!;
+      if (this.unsaved.has(oldest)) this.compact(oldest);
+      this.instances.delete(oldest);
+    }
     return t;
   }
 
-  private persistInstances(ids: Iterable<string>) {
-    const stmt = this.db.prepare(
-      "INSERT INTO text_instances (id, state, updated_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at",
-    );
-    for (const id of ids) stmt.run(id, JSON.stringify(this.instance(id).toJSON()), Date.now());
+  /**
+   * Durability per commit is an append (the ops), not a rewrite of the whole instance, so
+   * a keystroke in a long block costs the same as in a short one. Compaction folds the log
+   * into the stored state now and then.
+   */
+  private logOps(text: Commit["text"]) {
+    const stmt = this.db.prepare("INSERT INTO text_ops (instance_id, ops, created_at) VALUES (?,?,?)");
+    const now = Date.now();
+    for (const { instance, ops } of text) {
+      stmt.run(instance, JSON.stringify(ops), now);
+      const u = this.unsaved.get(instance) ?? { count: 0, timer: null };
+      u.count++;
+      if (u.timer) clearTimeout(u.timer);
+      u.timer = setTimeout(() => this.compact(instance), this.opts.compactIdleMs ?? 5_000);
+      this.unsaved.set(instance, u);
+    }
+  }
+
+  /** After a commit: compact instances whose log grew long. */
+  private compactBusy() {
+    for (const [id, u] of this.unsaved) if (u.count >= (this.opts.compactAfterOps ?? 200)) this.compact(id);
+  }
+
+  /**
+   * Fold an instance's op log into its stored state, collecting old tombstones on the way
+   * (their content goes; their ids stay, for offline edits that point at them).
+   */
+  compact(id: string) {
+    const u = this.unsaved.get(id);
+    if (u?.timer) clearTimeout(u.timer);
+    this.unsaved.delete(id);
+    const t = this.instances.get(id);
+    if (!t) return;
+    t.gc(Date.now() - (this.opts.tombstoneTtlMs ?? 24 * 3_600_000));
+    tx(this.db, () => {
+      this.db
+        .prepare("INSERT INTO text_instances (id, state, updated_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at")
+        .run(id, JSON.stringify(t.toJSON({ hiddenAt: true })), Date.now());
+      this.db.prepare("DELETE FROM text_ops WHERE instance_id = ?").run(id);
+    });
   }
 
   // ------------------------------------------------------------ writing
@@ -128,9 +179,10 @@ export class SyncService {
     const session = opts.session ?? clock.session;
     const result = tx(this.db, () => {
       const res = commitOps(state, { session, userId, tx: opts.tx ?? randomUUID() }, (apply) => fn({ state, clock, apply }), opts.check);
-      this.persistInstances(res.commit.text.map((t) => t.instance));
+      this.logOps(res.commit.text);
       return res;
     });
+    this.compactBusy();
     this.after(result.commit, userId);
     return result;
   }
@@ -347,6 +399,7 @@ export class SyncService {
 
   close() {
     this.flush();
+    for (const id of [...this.unsaved.keys()]) this.compact(id);
   }
 
   // ------------------------------------------------------------ migration

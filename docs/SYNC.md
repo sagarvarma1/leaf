@@ -72,21 +72,35 @@ commit (socket) can arrive in either order, and the client keeps the higher vers
 `POST /api/loadPageChunk` returns a page's records and the text instances they use. A "chunk" in
 Leaf is the whole page plus the synced blocks it embeds.
 
-## 3. Text: an RGA with Peritext formatting
+## 3. Text: an RGA with Peritext formatting, plus the Fugue fix
 
-`sync/text.ts`. Each block's text is a sequence CRDT, as Notion describes:
+`sync/text.ts`. Each block's text is a sequence CRDT, as Notion describes, with one change
+from the research that came after it:
 
 - **Character ids** are `session@clock`: the session that typed it and a Lamport clock (one
   higher than the highest clock the session has seen). A run typed in one go is one op with
   consecutive clocks, Notion's run-length grouping.
-- **Inserts name an origin**: the item they were typed after. That makes the text a tree, and the
-  text is the tree read in pre-order. Items with the same origin are ordered **newest first
-  (higher clock), with the session id as tie-breaker**, Notion's exact rule. Every replica builds
-  the same tree whatever order inserts arrive in, so everyone reads the same text. Two people
-  typing at the same spot get two intact runs, not interleaved letters.
+- **Inserts attach to a neighbour, which makes the text a tree read in order.** Siblings are
+  ordered **newest first (higher clock), with the session id as tie-breaker**, Notion's exact
+  rule. Every replica builds the same tree whatever order inserts arrive in, so everyone reads
+  the same text.
+- **The interleaving fix (Fugue).** In plain RGA, every insert goes after its left neighbour.
+  That has a known flaw: two people typing *backwards* at the same spot (each letter before the
+  last, e.g. typing with the caret parked) produce sibling chains that interleave letter by
+  letter. Leaf uses the rule from Fugue (Weidner & Kleppmann, *The Art of the Fugue*, 2023): a
+  new character is the right child of the character before the cursor, unless that one already
+  has right children; then it's the *left* child of the character after the cursor. Each
+  person's backwards run then chains off their own previous letter and stays whole. Forward
+  typing is unchanged (a chain of right children), and so is Notion's tie-break. Text stored by
+  the first, plain-RGA version loads unchanged: "after X, newest first" is exactly "right child
+  of X".
 - **Deletes keep tombstones**, because other people's offline edits may still point at a deleted
   item. Leaf adds one thing: visibility is a last-writer-wins register, so undo can bring
   deleted text back.
+- **Cleanup.** A tombstone hidden for more than a day (configurable) loses its *content* when the
+  server compacts the instance. Its id and place in the tree stay, so an offline edit that points
+  at it still lands; it just can't be restored any more. Notion's post doesn't say whether it
+  collects tombstones; this is what Yjs does too (keep ids, drop deleted content).
 - **Ops that arrive before what they reference wait** until it shows up. An offline client's
   queue can therefore arrive in any order.
 
@@ -184,11 +198,52 @@ Offline, you can do everything inside a page, structure included: new blocks, mo
 deletes, type changes. Database cells, comments and creating pages are REST calls, and they
 say "You're offline".
 
-## 8. What happens in each conflict
+## 8. Performance
+
+The standard text-CRDT benchmark is automerge-perf's **editing trace**: every keystroke of a real
+academic paper being written (259,778 edits, 104,852 final characters). `packages/shared/bench`
+replays it through the same block API the editor uses. On a MacBook (Node 22), single run:
+
+| | Leaf, first version | Leaf now | Yjs 13.6 (same machine) |
+| --- | --- | --- | --- |
+| All 259,778 edits, locally | ~40 min (quadratic; 20k edits took 15 s) | **1.07 s** | 1.19 s |
+| A second replica applies them | — | **0.30 s** | 0.78 s |
+| Stored size | — | 3.3 MB, **470 KB after cleanup** | 304 KB (binary) |
+| Load stored state | — | 0.13 s, **0.07 s after cleanup** | 0.013 s |
+| Heap | — | 217 MB | 102 MB |
+
+Leaf matches Yjs on editing and replay. Yjs still wins on storage and memory (binary encoding,
+compact structs); Leaf stores JSON.
+
+What made the difference:
+
+- **A chunked order index.** Items sit in document order in chunks of at most 1,024 that track
+  their visible count. Finding the n-th visible character, an item's position, or where a
+  remote insert goes is O(√n), and a local keystroke never reads the whole text.
+- **Run-length storage** (Notion's grouping). One person's continuous typing is one entry, and
+  visibility is run-length encoded too. A client that already has the start of a stored run
+  applies only the rest; the 1,000-seed simulation caught that case.
+- **Linear loading.** Stored ops are applied in creation order, and only ops whose parent is
+  missing wait.
+- **An append-only op log on the server.** Each commit appends its text ops instead of rewriting
+  the instance, so a keystroke in a long block costs the same as in a short one. The log is
+  folded into the stored state after 200 commits or 5 s idle, which is also when old tombstones
+  are collected.
+- **The editor bridge is linear.** Per keystroke it now compares each block's text with one
+  string comparison (a cached signature) and places children with one comparison per parent:
+
+  | Page size | Commit per keystroke (median) | Before |
+  | --- | --- | --- |
+  | 100 blocks | 0.3 ms | 0.5 ms |
+  | 1,000 blocks | 3.5 ms | 34 ms |
+  | 5,000 blocks | 19 ms | 790 ms |
+
+## 9. What happens in each conflict
 
 | Situation | Result |
 | --- | --- |
 | Two people type in the same paragraph | Both kept; runs typed at the same spot stay intact (newest first). |
+| Two people type *backwards* at the same spot | Both runs stay intact (the Fugue rule); plain RGA would interleave them. |
 | Both retype the same word | Both deletions and both insertions apply ("cat" → "dogcow"). A CRDT keeps all text; a person cleans up. |
 | Enter in a paragraph while someone types in its tail | Their text ends up in the new block. |
 | Backspace merges a block someone is typing in | Their text ends up in the merged block. |
@@ -199,12 +254,13 @@ say "You're offline".
 | An op no longer applies (its block was deleted first) | Skipped; the rest of the transaction commits. |
 | A transaction the user may not make | The whole transaction is refused; the client drops it and reloads the page. |
 
-## 9. How it's tested
+## 10. How it's tested
 
 - `packages/shared/test/sync.test.ts`:
   - Notion's examples ("Build cool things quickly", concurrent splits, split with concurrent
     typing, merge with concurrent typing).
-  - Peritext extension rules.
+  - Peritext extension rules, Fugue's backwards-typing case, loading data from the first
+    version, compact runs and tombstone cleanup, partially known runs.
   - The editor bridge is a fixed point (records → editor → records produces no ops).
   - Undo that skips other people's edits.
   - A randomized simulation with a server and three clients making random typing, deletes,
@@ -213,6 +269,6 @@ say "You're offline".
     ran clean.
 - `apps/server/test/convergence.test.ts`: the same protocol over real HTTP and WebSockets against
   the real server. Three clients make random concurrent edits; then offline merge, permission
-  refusals, and the state served after a restart.
+  refusals, op-log compaction with cleanup, and the state served after a restart.
 - `scripts/e2e.mjs`: two people in real browsers, including offline with the network cut (service
   worker included), a cold reload, and a reconnect that merges.

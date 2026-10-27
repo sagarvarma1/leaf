@@ -106,24 +106,29 @@ export function commitDesired(state: SyncState, clock: Clock, desired: Desired, 
   }
 
   // 4. Placement, top-down.
+  const placedIn = (parent: string) => state.getBlock(parent)!.content.filter((c) => desired.blocks.has(c) && exists(c));
   const place = (parent: string, content: string[]) => {
-    content.forEach((id, i) => {
-      const d = desired.blocks.get(id)!;
-      const after = i > 0 ? content[i - 1]! : null;
-      const b = state.getBlock(id);
-      if (!b || b.archived) {
-        if (d.kind === "ref") {
-          if (b) apply({ op: "restore", id, parent, after });
+    let placed = placedIn(parent);
+    // Usually nothing moved: one comparison per parent instead of one per child.
+    if (placed.length !== content.length || placed.some((id, i) => id !== content[i])) {
+      content.forEach((id, i) => {
+        const d = desired.blocks.get(id)!;
+        const after = i > 0 ? content[i - 1]! : null;
+        const b = state.getBlock(id);
+        if (!b || b.archived) {
+          if (d.kind === "ref") {
+            if (b) apply({ op: "restore", id, parent, after });
+          } else if (b) apply({ op: "restore", id, parent, after });
+          else apply({ op: "create", id, type: d.type, parent, after, properties: d.props, text: null });
+          placed = placedIn(parent);
           return;
         }
-        if (b) apply({ op: "restore", id, parent, after });
-        else apply({ op: "create", id, type: d.type, parent, after, properties: d.props, text: null });
-        return;
-      }
-      const container = state.getBlock(parent)!;
-      const placed = container.content.filter((c) => desired.blocks.has(c) && exists(c));
-      if (placed[i] !== id) apply({ op: "move", id, parent, after });
-    });
+        if (placed[i] !== id) {
+          apply({ op: "move", id, parent, after });
+          placed = placedIn(parent);
+        }
+      });
+    }
     for (const id of content) {
       const d = desired.blocks.get(id)!;
       if (d.kind === "block") place(id, d.content);

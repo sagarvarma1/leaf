@@ -38,9 +38,11 @@ section says exactly where it stops.
 - **Real-time collaboration on my own sync engine**, after Notion's design: blocks are records,
   edits are operations in transactions (`saveTransactions`), the server orders structure and
   broadcasts commits (its MessageStore), and text inside a block is a CRDT (RGA with Notion's
-  ordering rule, Peritext marks, text instances and slices so Enter/Backspace don't lose
-  concurrent typing). You get named, colored cursors, avatars of who is on the page, and undo
-  that only reverts your own edits. No Yjs.
+  ordering rule plus the Fugue fix for interleaving, Peritext marks, text instances and slices
+  so Enter/Backspace don't lose concurrent typing). On the standard editing-trace benchmark it
+  matches Yjs: 259,778 edits in about a second ([numbers](docs/SYNC.md#8-performance)). You get
+  named, colored cursors, avatars of who is on the page, and undo that only reverts your own
+  edits. No Yjs.
 - **Offline mode**: Leaf works on a plane. A service worker serves the app shell; a RecordCache
   keeps pages in IndexedDB (downloaded in the background for reasons: favorite, recent,
   workspace, inherited); and a TransactionQueue keeps your edits, structure included, until the
@@ -243,16 +245,19 @@ Leaf AI is a tool-use loop with Claude Opus 5.5, running on the server. Its tool
 ## Testing
 
 ```bash
-pnpm test        # unit + integration (Vitest): 88 tests
+pnpm test        # unit + integration (Vitest): 93 tests
 pnpm typecheck   # tsc across all packages
 pnpm e2e         # 35 browser checks (Playwright, headless Chromium). Run `npx playwright install chromium` once.
 FUZZ=1000 FUZZ_STEPS=800 pnpm --filter @leaf/shared test   # the convergence simulation, at length
+pnpm --filter @leaf/shared bench editing-trace.json            # the editing-trace benchmark (see bench/)
 ```
 
-- **Sync engine** (packages/shared, 24, including 8 simulation seeds):
+- **Sync engine** (packages/shared, 28, including 8 simulation seeds):
   - Notion's own examples: concurrent inserts, splits with concurrent typing, merges with
     concurrent typing, concurrent splits.
   - Peritext rules (bold extends, links don't), and the editor bridge as a fixed point.
+  - Fugue's backwards-typing case, loading data from the first version, compact runs,
+    tombstone cleanup, and runs a client half-knows.
   - Enter and Backspace recognised as split and merge, and undo that skips other people's edits.
   - Out-of-order delivery.
   - **A randomized simulation:** a server and three clients make random typing, deletes,
@@ -263,10 +268,11 @@ FUZZ=1000 FUZZ_STEPS=800 pnpm --filter @leaf/shared test   # the convergence sim
 - **API** (22): auth, permissions, share links, the page tree, trash, REST block writes,
   databases, two-way relation mirroring, rollups and formulas in export, nesting and columns,
   synced blocks across pages (search, access), comments, versions, search.
-- **Sync over the network** (10): clients doing exactly what the browser does (`loadPageChunk`,
+- **Sync over the network** (11): clients doing exactly what the browser does (`loadPageChunk`,
   the WebSocket, `saveTransactions`) against the real server. Live delivery, presence, three
   clients making random concurrent edits, offline merge, derived text in the block table, REST
-  edits reaching editors, refusals for viewers and outsiders, and restart durability.
+  edits reaching editors, refusals for viewers and outsiders, op-log compaction with cleanup,
+  and restart durability.
 - **Leaf AI** (8): edits attributed to the AI; presence and cursor seen mid-run; **Discard keeps
   a concurrent human edit**, and a block the AI wrote that a person typed into; cited answers;
   database edits by property name and their discard; refusing cross-page edits and bad input;
@@ -325,8 +331,8 @@ FUZZ=1000 FUZZ_STEPS=800 pnpm --filter @leaf/shared test   # the convergence sim
 - **Nesting**: children of any *text* block (paragraph, heading, callout, to-do, list item,
   toggle, quote), not of code blocks, images or embeds. Columns live at the top level of a page
   or synced block.
-- **Text instances grow**: tombstones are never garbage-collected (Notion's post doesn't cover
-  it either), and a block split many times reads several slices.
+- **Tombstones keep their ids forever** (their content is collected after a day), and a block
+  split many times reads several slices. Storage is JSON: about 1.5× Yjs's binary size.
 - **Synced blocks**: version history of a page doesn't include synced content, and you can't put
   pages, databases or other synced blocks inside one.
 - **Databases**: filters are AND-only, there's no timeline view, and sort/filter are shared per

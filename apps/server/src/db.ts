@@ -132,6 +132,14 @@ function migrate(db: DB) {
     PRIMARY KEY (block_id, instance_id)
   )`);
   db.exec("CREATE INDEX IF NOT EXISTS block_instances_inst ON block_instances(instance_id)");
+  // Text ops appended per commit; folded into text_instances.state by compaction.
+  db.exec(`CREATE TABLE IF NOT EXISTS text_ops (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    ops TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS text_ops_inst ON text_ops(instance_id, seq)");
   db.exec(`CREATE TABLE IF NOT EXISTS join_links (
     token TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,

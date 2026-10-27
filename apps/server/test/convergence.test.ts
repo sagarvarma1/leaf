@@ -175,6 +175,30 @@ describe("sync over HTTP + WebSocket", () => {
     expect(code).toBe("401");
   });
 
+  it("logs ops per commit, compacts them, and collects old tombstones' content", async () => {
+    const a = clients[0]!;
+    const id = a.blocks().find((x) => x.text)!.id;
+    const inst = a.view.getBlock(id)!.text![0]!.i;
+    a.edit((v, apply) => apply(insertOps(v, a.clock, v.getBlock(id)!, 0, [..."TEMP "])!));
+    await a.flush();
+    a.edit((v, apply) => {
+      for (const op of deleteOps(v, a.clock, v.getBlock(id)!, 0, 5)) apply(op);
+    });
+    await a.flush();
+    const logged = () => (s.leaf.db.prepare("SELECT COUNT(*) AS n FROM text_ops WHERE instance_id = ?").get(inst) as { n: number }).n;
+    expect(logged()).toBeGreaterThan(0);
+    // Compaction with a zero TTL: the log folds into the state, and "TEMP " loses its content.
+    (s.leaf.sync as any).opts.tombstoneTtlMs = -1;
+    s.leaf.sync.compact(inst);
+    (s.leaf.sync as any).opts.tombstoneTtlMs = undefined;
+    expect(logged()).toBe(0);
+    const stored = (s.leaf.db.prepare("SELECT state FROM text_instances WHERE id = ?").get(inst) as { state: string }).state;
+    expect(stored).not.toContain("TEMP");
+    // A fresh client still converges with the others.
+    const fresh = await client(alice);
+    await waitFor(() => fresh.json() === a.json(), 3000, "fresh client matches");
+  });
+
   it("persists: a restarted server serves the identical document", async () => {
     const before = await serverJSON();
     // A second server process on the same data file (the first one's memory isn't used).

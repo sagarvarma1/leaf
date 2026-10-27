@@ -154,9 +154,10 @@ const docJSON = (state: MemoryState) => JSON.stringify(toPM(state, PAGE, { title
 
 // ---------------------------------------------------------------- the text CRDT
 
-describe("text CRDT (RGA)", () => {
-  const ins = (inst: TextInstance, session: string, origin: string | null, s: string) => {
-    const op: TextOp = { t: "ins", id: `${session}@${inst.maxClock + 1}`, origin, value: s.split("") };
+describe("text CRDT (RGA + Fugue)", () => {
+  /** Type `s` right after item `after` (null: at the start), as a local edit would. */
+  const ins = (inst: TextInstance, session: string, after: string | null, s: string) => {
+    const op: TextOp = { t: "ins", id: `${session}@${inst.maxClock + 1}`, ...inst.placement(after), value: s.split("") };
     inst.apply([op]);
     return op;
   };
@@ -187,6 +188,73 @@ describe("text CRDT (RGA)", () => {
     b.apply([x]);
     expect(str(a)).toBe(str(b));
     expect(["aXXXYYYb", "aYYYXXXb"]).toContain(str(a));
+  });
+
+  it("Fugue: two people typing backwards at the same spot don't interleave", () => {
+    const a = new TextInstance("t");
+    ins(a, "S", null, "ab");
+    const b = a.clone();
+    const at = a.order()[0]!; // after "a"
+    // Each new letter goes before the previous one (the caret stays after "a").
+    const xs = ["3", "2", "1"].map((ch) => ins(a, "A", at, ch));
+    const ys = ["z", "y", "x"].map((ch) => ins(b, "B", at, ch));
+    a.apply(ys);
+    b.apply(xs);
+    expect(str(a)).toBe(str(b));
+    expect(["a123xyzb", "axyz123b"]).toContain(str(a));
+  });
+
+  it("loads text stored by the first (RGA, origin-based) engine unchanged", () => {
+    // "Hi" then "!" after "i", plus a concurrent "?" after "i": newest first.
+    const v1 = {
+      id: "t",
+      items: [
+        ["S@1", null, "H", null],
+        ["S@2", "S@1", "i", null],
+        ["S@4", "S@2", "!", null],
+        ["T@3", "S@2", "?", null],
+      ] as Array<[string, string | null, string, null]>,
+      marks: [],
+    };
+    const t = TextInstance.fromJSON(v1);
+    expect(str(t)).toBe("Hi!?");
+    // And ops written by old clients (with `origin`) still apply.
+    t.apply([{ t: "ins", id: "S@9", origin: "S@4", value: ["."] } as unknown as TextOp]);
+    expect(str(t)).toBe("Hi!.?");
+  });
+
+  it("stores runs compactly and collects old tombstones' content", () => {
+    const a = new TextInstance("t");
+    ins(a, "S", null, "hello world");
+    const ids = a.order();
+    a.apply([{ t: "vis", id: "S@100", targets: ids.slice(0, 6), visible: false }], 1_000); // "hello " deleted at t=1000
+    expect(str(a)).toBe("world");
+    expect(a.toJSON().runs).toEqual([["S@1", null, "R", "hello world"]]);
+    expect(a.gc(500)).toBe(0); // too recent
+    expect(a.gc(2_000)).toBe(6);
+    const json = a.toJSON();
+    expect(json.runs).toEqual([
+      ["S@1", null, "R", 6],
+      ["S@7", "S@6", "R", "world"],
+    ]);
+    // Collected items keep their ids: an offline edit typed after one still lands.
+    const late: TextOp = { t: "ins", id: "T@200", parent: ids[2]!, side: "R", value: ["!"] };
+    const b = TextInstance.fromJSON(json);
+    b.apply([late]);
+    expect(str(b)).toBe("!world");
+    // Undo can't bring collected text back.
+    b.apply([{ t: "vis", id: "S@300", targets: ids.slice(0, 6), visible: true }]);
+    expect(str(b)).toBe("!world");
+  });
+
+  it("a stored run that starts with text a replica already has still delivers the rest", () => {
+    const server = new TextInstance("t");
+    const first = ins(server, "S", null, "ab"); // a client got this as its own op…
+    ins(server, "S", server.order()[1]!, "cd"); // …but not this; the server stores "abcd" as one run
+    const client = new TextInstance("t");
+    client.apply([first]);
+    client.apply(server.ops());
+    expect(str(client)).toBe("abcd");
   });
 
   it("buffers ops that arrive before what they reference", () => {
@@ -543,6 +611,12 @@ describe("convergence under random concurrent and offline edits", () => {
       const truth = docJSON(net.server);
       for (const c of clients) {
         expect(c.replica.pending).toEqual([]);
+        if (process.env.FUZZ_DEBUG) {
+          for (const [id, inst] of net.server.instances) {
+            const mine = c.view.instance(id);
+            if (mine.order().join() !== inst.order().join()) console.log(`instance ${id}: order differs (server ${inst.size} items, client ${mine.size}, waiting ${mine.pendingOps})`);
+          }
+        }
         expect(pageText(c.view)).toEqual(pageText(net.server));
         expect(docJSON(c.view)).toBe(truth);
       }

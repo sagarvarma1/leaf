@@ -71,14 +71,6 @@ export function commitOps(
       if (op.op === "text" && res.textApplied?.length) text.set(op.instance, [...(text.get(op.instance) ?? []), ...res.textApplied]);
       ops.push(op);
       inverse.unshift(...res.inverse);
-      // Derived text right away, so later ops in the same edit read current values.
-      for (const id of res.text) {
-        const b = state.getBlock(id);
-        if (b) {
-          const next = deriveText(state, b);
-          if (next !== b) state.putBlock(next);
-        }
-      }
       return res.inverse;
     } catch (err) {
       if (!(err instanceof OpError)) throw err;
@@ -86,7 +78,15 @@ export function commitOps(
       return [];
     }
   });
-  for (const id of textBlocks) changed.add(id);
+  // Derived text (rich_text / title) once per commit, not per op: ops read the instances.
+  for (const id of textBlocks) {
+    const b = state.getBlock(id);
+    if (b) {
+      const next = deriveText(state, b);
+      if (next !== b) state.putBlock(next);
+    }
+    changed.add(id);
+  }
   return {
     commit: {
       tx: meta.tx,
