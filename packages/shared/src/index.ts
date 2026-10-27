@@ -10,3 +10,4 @@ export * from "./sync/pm.js";
 export * from "./sync/commit.js";
 export * from "./sync/memory.js";
 export * from "./sync/engine.js";
+export * from "./sync/validate.js";

@@ -8,9 +8,12 @@ export class MemoryState implements SyncState {
   readonly instances: Map<string, TextInstance>;
   private byInstance = new Map<string, Set<string>>();
   userId: string | null;
+  /** Bump record versions on every write, like the server's database does. */
+  private versions: boolean;
 
-  constructor(opts: { userId?: string | null; blocks?: Map<string, Block>; instances?: Map<string, TextInstance> } = {}) {
+  constructor(opts: { userId?: string | null; blocks?: Map<string, Block>; instances?: Map<string, TextInstance>; versions?: boolean } = {}) {
     this.userId = opts.userId ?? null;
+    this.versions = opts.versions ?? false;
     this.blocks = opts.blocks ?? new Map();
     this.instances = opts.instances ?? new Map();
     for (const b of this.blocks.values()) this.index(b, true);
@@ -26,6 +29,7 @@ export class MemoryState implements SyncState {
 
   putBlock(b: Block) {
     const old = this.blocks.get(b.id);
+    if (this.versions) b = { ...b, version: (old?.version ?? 0) + 1 };
     if (old) this.index(old, false);
     this.blocks.set(b.id, b);
     this.index(b, true);

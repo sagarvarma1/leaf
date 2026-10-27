@@ -84,6 +84,8 @@ export class Hub {
 
   /** Send a commit to the subscribers of the documents it touched (not back to its sender). */
   publishCommit(workspaceId: string, commit: Commit, docs: Set<string>) {
+    // Most subscribers get the whole commit: encode it once for them.
+    let whole: string | null = null;
     for (const s of this.subs) {
       if (s.workspaceId !== workspaceId || !s.docs) continue;
       if (s.session && s.session === commit.session) continue;
@@ -92,7 +94,8 @@ export class Hub {
         const d = docOf(r);
         return (r.type === "page" || r.type === "database" || (d !== null && s.docs!.has(d))) && s.canSee(r);
       });
-      s.send(JSON.stringify({ type: "commit", commit: { ...commit, records } } satisfies HubEvent));
+      if (records.length === commit.records.length) s.send((whole ??= JSON.stringify({ type: "commit", commit } satisfies HubEvent)));
+      else s.send(JSON.stringify({ type: "commit", commit: { ...commit, records } } satisfies HubEvent));
     }
   }
 

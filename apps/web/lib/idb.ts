@@ -42,6 +42,27 @@ export async function idbSet(store: Store, key: string, value: unknown): Promise
   });
 }
 
+export async function idbKeys(store: Store): Promise<string[]> {
+  const d = await db();
+  if (!d) return [];
+  return new Promise((resolve) => {
+    const req = d.transaction(store, "readonly").objectStore(store).getAllKeys();
+    req.onsuccess = () => resolve((req.result as IDBValidKey[]).map(String));
+    req.onerror = () => resolve([]);
+  });
+}
+
+export async function idbDelete(store: Store, key: string): Promise<void> {
+  const d = await db();
+  if (!d) return;
+  return new Promise((resolve) => {
+    const t = d.transaction(store, "readwrite");
+    t.objectStore(store).delete(key);
+    t.oncomplete = () => resolve();
+    t.onerror = () => resolve();
+  });
+}
+
 /** Delete everything this device keeps (logout). */
 export async function idbClear(): Promise<void> {
   const d = await db();

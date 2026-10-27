@@ -17,6 +17,7 @@ if (process.env.LEAF_SEED !== "0" && seed(leaf)) console.log("Seeded demo worksp
 // Guest sandboxes expire; sweep them at boot and hourly.
 const sweep = () => {
   const n = leaf.sweepExpired();
+  leaf.sync.pruneTransactions();
   if (n) console.log(`Swept ${n} expired sandbox${n === 1 ? "" : "es"}`);
 };
 sweep();

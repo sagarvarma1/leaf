@@ -34,7 +34,7 @@ import {
 } from "@leaf/shared";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { api, ApiError } from "./api";
-import { idbClear, idbGet, idbSet } from "./idb";
+import { idbClear, idbDelete, idbGet, idbKeys, idbSet } from "./idb";
 
 export interface Presence {
   session: string;
@@ -49,6 +49,15 @@ interface CachedDoc {
   docs: string[];
   savedAt: number;
 }
+
+interface StoredQueue {
+  txs: Transaction[];
+  /** The owning tab's last heartbeat. */
+  at: number;
+}
+
+const QUEUE_HEARTBEAT_MS = 10_000;
+const QUEUE_ORPHAN_MS = 30_000;
 
 interface UndoEntry {
   inverse: RecordOp[];
@@ -248,6 +257,7 @@ export class SyncClient {
 
   /** Reload followed documents (whatever happened while disconnected), then send the queue. */
   private async catchUp() {
+    await this.adoptOrphans();
     for (const d of [...this.open.keys(), ...this.kept]) {
       try {
         await this.fetchDoc(d);
@@ -358,24 +368,66 @@ export class SyncClient {
 
   // ------------------------------------------------------------ TransactionQueue
 
+  /**
+   * One queue per tab (session), with a heartbeat: two tabs of the same user never
+   * overwrite each other's unsent edits. A tab that starts adopts the queues of tabs that
+   * are gone (no heartbeat for 30 s), so edits from a tab closed while offline still go out.
+   */
+  private queuePrefix() {
+    return `${this.userId ?? "guest"}:${this.workspaceId}:`;
+  }
+
   private queueKey() {
-    return `${this.userId ?? "guest"}:${this.workspaceId}`;
+    return this.queuePrefix() + this.session;
   }
 
   private async persistQueue() {
     if (!this.userId) return;
-    await idbSet("queue", this.queueKey(), this.replica.pending);
+    await idbSet("queue", this.queueKey(), { txs: this.replica.pending, at: Date.now() } satisfies StoredQueue);
   }
 
-  /** Transactions queued before a reload (offline edits) come back and are sent. */
+  /** Transactions queued by earlier tabs (a reload, a crash, offline edits) come back and are sent. */
   private async restoreQueue() {
     if (!this.userId) return;
-    const saved = await idbGet<Transaction[]>("queue", this.queueKey());
-    if (!saved?.length) return;
+    // Liveness: a Web Lock held for as long as this tab lives (the browser releases it when
+    // the tab closes or reloads); a heartbeat where locks aren't available.
+    const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+    if (locks) void locks.request(`leaf-queue:${this.session}`, () => new Promise<never>(() => {}));
+    const heartbeat = setInterval(() => void this.persistQueue(), QUEUE_HEARTBEAT_MS);
+    (heartbeat as any).unref?.();
+    if (typeof window !== "undefined") window.addEventListener("pagehide", () => void idbSet("queue", this.queueKey(), { txs: this.replica.pending, at: 0 }));
+    await this.persistQueue();
+    await this.adoptOrphans();
+  }
+
+  /** Take over the queues of tabs that are gone (at startup, and on every reconnect). */
+  private async adoptOrphans() {
+    if (!this.userId) return;
+    const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+    const held = locks ? new Set(((await locks.query()).held ?? []).map((l) => l.name)) : null;
+    const orphans: Transaction[] = [];
+    const adopted: string[] = [];
+    const legacy = `${this.userId}:${this.workspaceId}`; // before per-tab queues
+    for (const key of await idbKeys("queue")) {
+      if (key === this.queueKey() || (key !== legacy && !key.startsWith(this.queuePrefix()))) continue;
+      const saved = await idbGet<StoredQueue | Transaction[]>("queue", key);
+      const q: StoredQueue = Array.isArray(saved) ? { txs: saved, at: 0 } : (saved ?? { txs: [], at: 0 });
+      // Is the tab that owns it still open?
+      const session = key.slice(this.queuePrefix().length);
+      if (held ? held.has(`leaf-queue:${session}`) : Date.now() - q.at < QUEUE_ORPHAN_MS) continue;
+      orphans.push(...q.txs);
+      adopted.push(key);
+    }
+    if (!orphans.length) {
+      for (const key of adopted) await idbDelete("queue", key);
+      return;
+    }
     // Oldest first, ahead of anything queued since this tab started.
     const known = new Set(this.replica.pending.map((t) => t.id));
-    this.replica.pending = [...saved.filter((tx) => !known.has(tx.id)), ...this.replica.pending];
+    this.replica.pending = [...orphans.filter((tx) => !known.has(tx.id)), ...this.replica.pending];
     this.replica.rebuild([]);
+    await this.persistQueue();
+    for (const key of adopted) await idbDelete("queue", key);
     this.notify("load");
     void this.flush();
   }

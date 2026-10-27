@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   Clock,
   commitDesired,
@@ -63,8 +63,12 @@ const pageText = (state: MemoryState) =>
 
 /** A tiny in-memory deployment: one server, several clients with replicas. */
 class Net {
-  server = new MemoryState();
+  server = new MemoryState({ versions: true });
   clients: Client[] = [];
+  /** Transactions committed, by id (the server applies each once). */
+  committed = new Set<string>();
+  /** Network faults: reorder, duplicate, lose confirmations. */
+  faults: (() => number) | null = null;
   constructor(inputs: BlockInput[] = [{ type: "paragraph", properties: { rich_text: [{ text: "Hello" }] } }]) {
     this.server.putBlock(pageBlock());
     const clock = new Clock("seed");
@@ -76,8 +80,20 @@ class Net {
     this.clients.push(c);
     return c;
   }
-  broadcast(commit: Commit) {
-    for (const c of this.clients) if (c.online) c.inbox.push(commit);
+  broadcast(commit: Commit, except?: Client) {
+    for (const c of this.clients) if (c.online && c !== except) c.inbox.push(commit);
+  }
+  /** saveTransactions: apply once; a re-sent transaction gets the current records instead. */
+  save(tx: Transaction, from: Client): Commit {
+    if (this.committed.has(tx.id)) {
+      const ids = new Set<string>();
+      for (const op of tx.ops) for (const k of ["id", "parent", "into", "from", "newId"]) if (typeof (op as any)[k] === "string") ids.add((op as any)[k]);
+      return { tx: tx.id, session: from.name, userId: from.name, records: [...ids].map((id) => this.server.getBlock(id)!).filter(Boolean), text: [], skipped: 0 };
+    }
+    this.committed.add(tx.id);
+    const commit = commitTransaction(this.server, tx, { session: from.name, userId: from.name });
+    this.broadcast(commit, from);
+    return commit;
   }
 }
 
@@ -109,19 +125,34 @@ class Client {
     this.replica.local(tx);
     return tx;
   }
-  /** Send pending transactions in order (the server commits and broadcasts each). */
+  /** Send pending transactions in order; the confirmation comes back as the reply. */
   flush() {
     if (!this.online) return;
     for (const tx of [...this.replica.pending]) {
       if (this.sent.has(tx.id)) continue;
       this.sent.add(tx.id);
-      this.net.broadcast(commitTransaction(this.net.server, tx, { session: this.name, userId: this.name }));
+      const commit = this.net.save(tx, this);
+      // A lost reply: the server committed it, but this client will send it again.
+      if (this.net.faults && this.net.faults() < 0.15) {
+        this.sent.delete(tx.id);
+        continue;
+      }
+      this.replica.receive(commit);
     }
   }
   deliver() {
     if (!this.online) return;
-    const batch = this.inbox;
+    let batch = this.inbox;
     this.inbox = [];
+    const f = this.net.faults;
+    if (f) {
+      // Reorder, and deliver some twice.
+      batch = batch.flatMap((c) => (f() < 0.1 ? [c, c] : [c]));
+      for (let i = batch.length - 1; i > 0; i--) {
+        const j = Math.floor(f() * (i + 1));
+        [batch[i], batch[j]] = [batch[j]!, batch[i]!];
+      }
+    }
     for (const c of batch) this.replica.receive(c);
   }
   /** Reload from the server (page load, or after being offline). */
@@ -541,11 +572,12 @@ function rng(seed: number) {
 }
 
 describe("convergence under random concurrent and offline edits", () => {
-  // FUZZ=300 pnpm test runs 300 seeds (the default 8 keep the suite fast).
+  // FUZZ=300 pnpm test runs 300 seeds (the default 8 keep the suite fast). Even seeds run
+  // with network faults: reordered and duplicated messages, lost confirmations.
   const seeds = Array.from({ length: Number(process.env.FUZZ ?? 8) }, (_, i) => i + 1);
   const steps = Number(process.env.FUZZ_STEPS ?? 300);
   for (const seed of seeds) {
-    it(`seed ${seed}: every replica ends identical to the server`, () => {
+    it(`seed ${seed}${seed % 2 ? "" : " (network faults)"}: every replica ends identical to the server`, () => {
       const rand = rng(seed);
       const pick = <T,>(xs: T[]) => xs[Math.floor(rand() * xs.length)]!;
       const net = new Net([
@@ -554,6 +586,7 @@ describe("convergence under random concurrent and offline edits", () => {
         { type: "bulleted_list_item", properties: { rich_text: [{ text: "gamma" }] } },
       ]);
       const clients = ["a", "b", "c"].map((n) => net.client(n));
+      if (seed % 2 === 0) net.faults = rng(seed * 7919);
       let fresh = 0;
 
       for (let step = 0; step < steps; step++) {
@@ -618,6 +651,127 @@ describe("convergence under random concurrent and offline edits", () => {
           }
         }
         expect(pageText(c.view)).toEqual(pageText(net.server));
+        expect(docJSON(c.view)).toBe(truth);
+      }
+    });
+  }
+});
+
+// ---------------------------------------------------------------- editor-level fuzz
+
+/** Edits shaped like the editor's: done to the editor document, committed through the bridge. */
+function editorEdit(doc: PMNode, rand: () => number, fresh: () => string): PMNode {
+  const d = JSON.parse(JSON.stringify(doc)) as PMNode;
+  const body = d.content!.slice(1);
+  const pick = <T,>(xs: T[]) => xs[Math.floor(rand() * xs.length)]!;
+  const isText = (n: PMNode) => n.type === "paragraph" || n.type === "heading";
+  const textOf = (n: PMNode) => (n.content ?? []).map((t) => t.text ?? "").join("");
+  const setText = (n: PMNode, t: string) => (n.content = t ? [{ type: "text", text: t }] : []);
+  const textNodes = body.map((n, i) => ({ n, i })).filter(({ n }) => isText(n));
+  const k = rand();
+  if (!textNodes.length || k < 0.05) {
+    body.push({ type: "paragraph", attrs: { blockId: fresh() }, content: [{ type: "text", text: "new" }] });
+  } else if (k < 0.45) {
+    const { n } = pick(textNodes);
+    const t = textOf(n);
+    const at = Math.floor(rand() * (t.length + 1));
+    setText(n, t.slice(0, at) + "ab".slice(0, 1 + Math.floor(rand() * 2)) + t.slice(at));
+  } else if (k < 0.55) {
+    const { n } = pick(textNodes);
+    const t = textOf(n);
+    if (t.length) {
+      const at = Math.floor(rand() * t.length);
+      setText(n, t.slice(0, at) + t.slice(at + 1));
+    }
+  } else if (k < 0.67) {
+    // Enter in the middle of a line.
+    const { n, i } = pick(textNodes);
+    const t = textOf(n);
+    const at = Math.floor(rand() * (t.length + 1));
+    setText(n, t.slice(0, at));
+    body.splice(i + 1, 0, { type: "paragraph", attrs: { blockId: fresh() }, content: t.slice(at) ? [{ type: "text", text: t.slice(at) }] : [] });
+  } else if (k < 0.75) {
+    // Backspace at the start of a line: join it to the line above.
+    const cands = textNodes.filter(({ i }) => i > 0 && isText(body[i - 1]!));
+    if (cands.length) {
+      const { n, i } = pick(cands);
+      setText(body[i - 1]!, textOf(body[i - 1]!) + textOf(n));
+      body.splice(i, 1);
+    }
+  } else if (k < 0.81) {
+    // Turn into a heading / back into text.
+    const { n } = pick(textNodes);
+    if (n.type === "paragraph") Object.assign(n, { type: "heading", attrs: { ...n.attrs, level: 1 + Math.floor(rand() * 3) } });
+    else Object.assign(n, { type: "paragraph", attrs: { blockId: n.attrs!.blockId } });
+  } else if (k < 0.86) {
+    // Tab: nest a paragraph under the paragraph above.
+    const cands = textNodes.filter(({ n, i }) => n.type === "paragraph" && i > 0 && body[i - 1]!.type === "paragraph");
+    if (cands.length) {
+      const { n, i } = pick(cands);
+      body.splice(i - 1, 2, { type: "nest", content: [body[i - 1]!, n] });
+    }
+  } else if (k < 0.9) {
+    // Make it a bullet.
+    const { n, i } = pick(textNodes.filter(({ n }) => n.type === "paragraph").concat(textNodes.slice(0, 1)));
+    if (n.type === "paragraph") body.splice(i, 1, { type: "bulletList", content: [{ type: "listItem", attrs: { blockId: n.attrs!.blockId }, content: [{ type: "paragraph", attrs: { blockId: `${n.attrs!.blockId}:p` }, content: n.content }] }] });
+  } else if (k < 0.95 && body.length > 1) {
+    // Drag a block somewhere else.
+    const from = Math.floor(rand() * body.length);
+    const [node] = body.splice(from, 1);
+    body.splice(Math.floor(rand() * (body.length + 1)), 0, node!);
+  } else if (body.length > 1) {
+    body.splice(Math.floor(rand() * body.length), 1);
+  }
+  d.content = [d.content![0]!, ...(body.length ? body : [{ type: "paragraph", attrs: { blockId: fresh() } }])];
+  return d;
+}
+
+const opStats = new Map<string, number>();
+describe("convergence through the editor bridge", () => {
+  afterAll(() => {
+    if (process.env.FUZZ_STATS) console.log("ops produced:", JSON.stringify(Object.fromEntries(opStats)));
+  });
+  const seeds = Array.from({ length: Number(process.env.FUZZ ?? 6) }, (_, i) => i + 1);
+  const steps = Number(process.env.FUZZ_STEPS ?? 200);
+  for (const seed of seeds) {
+    it(`seed ${seed}: editor-shaped edits converge, and every render is a fixed point`, () => {
+      const rand = rng(seed + 1_000);
+      const net = new Net([
+        { type: "paragraph", properties: { rich_text: [{ text: "alpha beta" }] } },
+        { type: "heading_2", properties: { rich_text: [{ text: "gamma" }] } },
+        { type: "paragraph", properties: { rich_text: [{ text: "delta" }] } },
+      ]);
+      const clients = ["a", "b", "c"].map((n) => net.client(n));
+      let n = 0;
+      for (let step = 0; step < steps; step++) {
+        const c = clients[Math.floor(rand() * clients.length)]!;
+        const r = rand();
+        if (r < 0.04) {
+          if (c.online) c.goOffline();
+          else c.goOnline();
+          continue;
+        }
+        if (r < 0.3) {
+          c.flush();
+          c.deliver();
+          continue;
+        }
+        const next = editorEdit(toPM(c.view, PAGE, { title: true }), rand, () => `${c.name}-${++n}`);
+        const tx = c.edit((v, apply) => commitDesired(v, c.clock, fromPM(next, PAGE), apply));
+        if (process.env.FUZZ_STATS) for (const op of tx.ops) opStats.set(op.op, (opStats.get(op.op) ?? 0) + 1);
+        // What the client renders now is what it asked for, modulo normalisation, and reading
+        // it back changes nothing.
+        const shown = toPM(c.view, PAGE, { title: true });
+        const again: RecordOp[] = [];
+        commitDesired(c.view.fork(), c.clock, fromPM(shown, PAGE), (op) => again.push(op));
+        expect(again).toEqual([]);
+      }
+      for (const c of clients) if (!c.online) c.goOnline();
+      settle(net);
+      for (const c of clients) c.catchUp();
+      const truth = docJSON(net.server);
+      for (const c of clients) {
+        expect(c.replica.pending).toEqual([]);
         expect(docJSON(c.view)).toBe(truth);
       }
     });

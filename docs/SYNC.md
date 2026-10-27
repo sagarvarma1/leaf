@@ -51,8 +51,18 @@ confirmed (`{ id, ops }`).
 `POST /api/saveTransactions` (`apps/server/src/sync.ts`). For each transaction, in one SQLite
 transaction:
 
-1. Each op is checked against the caller's access (workspace member, or an edit share link
-   covering the block). A permission failure **rejects the whole transaction**, as in Notion.
+1. Each op's **shape** is validated (`sync/validate.ts`: ids, block types, sizes, single-unit
+   inserts, known marks; clients can't send server-only ops). Each op is checked against the
+   caller's access (workspace member, or an edit share link covering the block), including
+   **which text a block may show**: a block's slices may only point at its own instance or at
+   instances shown by blocks the user can edit in the same workspace, so text can't be read
+   across workspaces by pointing a block at it. A failure **rejects the whole transaction**, as
+   in Notion. The text instances it touched are dropped from the cache, so nothing
+   half-applied survives in memory.
+1. **Each transaction is applied once.** Committed transaction ids are recorded in the same
+   SQLite transaction. A client whose answer was lost sends the transaction again; the
+   server doesn't re-apply it, which could undo a later edit by someone else, and answers with
+   the current records instead.
 2. Each op is applied with the shared engine. Leaf deviates here. An op that no longer applies
    because someone else's change got there first, for example a move into a block that was just
    deleted, is **skipped** rather than failing the transaction. Rejecting the whole transaction
@@ -152,7 +162,10 @@ block.text = [{ i: instance, from: item | null, to: item | null }, …]   // [be
 - **TransactionQueue.** A local edit is applied to the view immediately, appended to the queue,
   saved in IndexedDB (it survives a reload or a crash while offline), and sent oldest first.
   Everything queued goes up in one `saveTransactions` call, and the next call waits for the
-  answer.
+  answer. **Each tab has its own queue**, so two tabs never overwrite each other's unsent
+  edits. A tab holds a Web Lock while it lives, and the queues of tabs that are gone are
+  adopted at startup and on every reconnect. Edits from a tab closed while offline still go
+  out.
 - **RecordCache.** Every opened or kept page's records and text instances are written to
   IndexedDB, so a page opens from there when the network is down.
 - **Catch-up.** After reconnecting, followed pages are reloaded with `loadPageChunk` and the
@@ -256,6 +269,8 @@ What made the difference:
 
 ## 10. How it's tested
 
+Every check below runs in `pnpm test` / `pnpm e2e`. The long runs are flags on the same tests.
+
 - `packages/shared/test/sync.test.ts`:
   - Notion's examples ("Build cool things quickly", concurrent splits, split with concurrent
     typing, merge with concurrent typing).
@@ -263,12 +278,31 @@ What made the difference:
     version, compact runs and tombstone cleanup, partially known runs.
   - The editor bridge is a fixed point (records → editor → records produces no ops).
   - Undo that skips other people's edits.
-  - A randomized simulation with a server and three clients making random typing, deletes,
-    formatting, splits, merges, creates, moves and deletes, going offline and back. Every replica
-    must end identical to the server. 8 seeds run by default, and `FUZZ=1000 FUZZ_STEPS=800`
-    ran clean.
+  - **A randomized simulation of the engine**: a server and three clients make random typing,
+    deletes, formatting, splits, merges, creates, moves and deletes, going offline and back.
+    Every replica must end identical to the server. Half the seeds add **network faults**:
+    reordered and duplicated messages, and lost confirmations that make clients re-send.
+    `FUZZ=1000 FUZZ_STEPS=800` ran clean. This checks convergence. The server test below checks
+    that a re-sent transaction isn't applied twice, which convergence alone wouldn't catch.
+  - **A randomized simulation through the editor bridge**: clients change their editor document
+    the way the editor does (typing, Enter, Backspace, turn into, Tab, bullets, drag, delete),
+    and the bridge turns that into ops. Everyone must converge, and every render must be a
+    fixed point. 300 seeds × 400 edits ran clean, producing hundreds of each kind of op: splits,
+    merges, moves, creates, deletes.
 - `apps/server/test/convergence.test.ts`: the same protocol over real HTTP and WebSockets against
   the real server. Three clients make random concurrent edits; then offline merge, permission
   refusals, op-log compaction with cleanup, and the state served after a restart.
-- `scripts/e2e.mjs`: two people in real browsers, including offline with the network cut (service
-  worker included), a cold reload, and a reconnect that merges.
+- `apps/server/test/hardening.test.ts`:
+  - re-sent transactions are applied once;
+  - a refused transaction leaves no trace in the database or in memory (verified to fail when
+    the fix is removed);
+  - malformed ops are rejected;
+  - another workspace's text can't be reached through slices or text ops.
+- **Load** (`apps/server/bench/load.ts`, with a 20-client version in the suite): 100 simulated
+  people typing on one page at once, over HTTP and WebSockets, all converge. The server spends
+  about 0.8 ms per commit, including the broadcast to 100 subscribers.
+- `scripts/e2e.mjs`: two people in real browsers. It covers:
+  - offline with the network cut (service worker included), a cold reload, and a reconnect
+    that merges;
+  - Enter in the middle of a line someone is typing in (their text follows into the new block);
+  - two tabs offline with one closed before reconnecting.

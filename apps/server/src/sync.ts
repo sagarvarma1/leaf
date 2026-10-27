@@ -27,6 +27,7 @@ import {
   type TextInstanceJSON,
   type TextOp,
   type Transaction,
+  validateTransaction,
 } from "@leaf/shared";
 import { randomUUID } from "node:crypto";
 import { tx, type DB } from "./db.js";
@@ -58,6 +59,8 @@ export interface EditResult {
 }
 
 class DbState implements SyncState {
+  /** Instances this edit touched (dropped from the cache if the edit fails). */
+  readonly touched = new Set<string>();
   constructor(
     private sync: SyncService,
     readonly userId: string | null,
@@ -72,6 +75,7 @@ class DbState implements SyncState {
     this.sync.store.put(b);
   }
   instance(id: string) {
+    this.touched.add(id);
     return this.sync.instance(id);
   }
   blocksOfInstance(id: string) {
@@ -173,15 +177,24 @@ export class SyncService {
    * Run an edit: `fn` produces ops through `ctx.apply` (each applied immediately, so it
    * can read their effect). Everything commits in one SQLite transaction, then publishes.
    */
-  edit(userId: string | null, fn: (ctx: EditContext) => void, opts: { session?: string; check?: (op: RecordOp) => void; tx?: string; clock?: Clock } = {}): EditResult {
-    const state = new DbState(this, userId);
+  edit(userId: string | null, fn: (ctx: EditContext) => void, opts: { session?: string; check?: (op: RecordOp) => void; tx?: string; clock?: Clock; state?: DbState } = {}): EditResult {
+    const state = opts.state ?? new DbState(this, userId);
     const clock = opts.clock ?? this.clock;
     const session = opts.session ?? clock.session;
-    const result = tx(this.db, () => {
-      const res = commitOps(state, { session, userId, tx: opts.tx ?? randomUUID() }, (apply) => fn({ state, clock, apply }), opts.check);
-      this.logOps(res.commit.text);
-      return res;
-    });
+    let result: EditResult;
+    try {
+      result = tx(this.db, () => {
+        const res = commitOps(state, { session, userId, tx: opts.tx ?? randomUUID() }, (apply) => fn({ state, clock, apply }), opts.check);
+        this.logOps(res.commit.text);
+        if (opts.tx) this.db.prepare("INSERT INTO transactions (id, user_id, created_at) VALUES (?,?,?)").run(opts.tx, userId, Date.now());
+        return res;
+      });
+    } catch (err) {
+      // The database rolled back; the cached text instances it touched may not have.
+      // Drop them, so the next read reloads what was actually committed.
+      for (const id of state.touched) this.instances.delete(id);
+      throw err;
+    }
     this.compactBusy();
     this.after(result.commit, userId);
     return result;
@@ -189,10 +202,24 @@ export class SyncService {
 
   /** A transaction from a client, checked op by op with `canEdit`. */
   commit(userId: string, session: string, transaction: Transaction, canEdit: (b: Block) => boolean): Commit {
-    if (!transaction || typeof transaction.id !== "string" || !Array.isArray(transaction.ops)) throw new HttpError(400, "Bad transaction");
-    if (transaction.ops.length > 5000) throw new HttpError(413, "Transaction too large");
+    const invalid = validateTransaction(transaction);
+    if (invalid) throw new HttpError(400, `Bad transaction: ${invalid}`);
+    // Already committed (the client didn't get the answer and sent it again): don't apply it
+    // twice; answer with the current copies of the records it touched.
+    if (this.db.prepare("SELECT 1 FROM transactions WHERE id = ?").get(transaction.id)) return this.replay(transaction, session, userId, canEdit);
     const created = new Set<string>();
     const state = new DbState(this, userId);
+    /** Text a block may show: its own instance, or instances only blocks this user can edit show. */
+    const canUseInstance = (instance: string, blockId: string) => {
+      if (instance === blockId || created.has(instance)) return;
+      const holders = state.blocksOfInstance(instance);
+      if (!holders.length) throw new HttpError(400, "Unknown text");
+      const ws = this.store.get(blockId)?.workspace_id;
+      for (const h of holders) {
+        const b = this.store.get(h);
+        if (!b || (ws && b.workspace_id !== ws) || !canEdit(b)) throw new HttpError(403, "You can't use that text");
+      }
+    };
     const need = (id: string | null | undefined) => {
       if (!id) throw new HttpError(400, "Bad op");
       const b = this.store.get(id);
@@ -206,8 +233,10 @@ export class SyncService {
           if (!parent) return; // skipped by the engine
           need(op.parent);
           if (op.type === "database") throw new HttpError(400, "Create databases with their own endpoint");
-          if (this.store.get(op.id) && this.store.get(op.id)!.workspace_id !== parent.workspace_id) throw new HttpError(403, "Block belongs elsewhere");
+          const existing = this.store.get(op.id);
+          if (existing && (existing.workspace_id !== parent.workspace_id || !canEdit(existing))) throw new HttpError(403, "Block belongs elsewhere");
           created.add(op.id);
+          for (const sl of op.text ?? []) canUseInstance(sl.i, op.id);
           return;
         }
         case "update": {
@@ -218,6 +247,7 @@ export class SyncService {
             if (op.type || b.type === "database" || Object.keys(op.properties ?? {}).some((k) => !allowed.has(k))) throw new HttpError(400, "Use the page and database endpoints for that");
           }
           if (op.type === "page" || op.type === "database") throw new HttpError(400, "Can't turn a block into a page here");
+          for (const sl of op.text ?? []) canUseInstance(sl.i, op.id);
           return;
         }
         case "move":
@@ -234,13 +264,21 @@ export class SyncService {
         case "text": {
           const holders = state.blocksOfInstance(op.instance);
           if (holders.length) for (const id of holders) need(id);
-          else if (!created.has(op.instance)) need(op.instance);
+          else if (!created.has(op.instance)) {
+            // A block's own instance before it has any text: the block must exist and be editable.
+            if (!this.store.get(op.instance)) throw new HttpError(400, "Unknown text");
+            need(op.instance);
+          }
           return;
         }
-        case "split":
+        case "split": {
           need(op.id);
+          const existing = this.store.get(op.newId);
+          if (existing && !existing.archived) return; // already split: the engine skips it
+          if (existing && !canEdit(existing)) throw new HttpError(403, "Block belongs elsewhere");
           created.add(op.newId);
           return;
+        }
         case "merge":
           need(op.into);
           need(op.from);
@@ -254,8 +292,27 @@ export class SyncService {
       ({ apply }) => {
         for (const op of transaction.ops) apply(op);
       },
-      { session, check, tx: transaction.id },
+      { session, check, tx: transaction.id, state },
     ).commit;
+  }
+
+  /** The answer to a re-sent transaction: the records it touched, as they are now. */
+  private replay(transaction: Transaction, session: string, userId: string, canEdit: (b: Block) => boolean): Commit {
+    const ids = new Set<string>();
+    for (const op of transaction.ops) {
+      for (const k of ["id", "parent", "into", "from", "newId"] as const) {
+        const v = (op as Record<string, unknown>)[k];
+        if (typeof v === "string") ids.add(v);
+      }
+      if (op.op === "text") for (const b of this.store.blocksOfInstance(op.instance)) ids.add(b);
+    }
+    const records = [...ids].map((id) => this.store.get(id)).filter((b): b is Block => !!b && canEdit(b));
+    return { tx: transaction.id, session, userId, records, text: [], skipped: 0 };
+  }
+
+  /** Forget committed transaction ids older than a week (clients re-send within minutes). */
+  pruneTransactions(before = Date.now() - 7 * 86_400_000) {
+    this.db.prepare("DELETE FROM transactions WHERE created_at < ?").run(before);
   }
 
   /** Broadcast, re-index and maybe snapshot the documents a commit touched. */

@@ -132,6 +132,13 @@ function migrate(db: DB) {
     PRIMARY KEY (block_id, instance_id)
   )`);
   db.exec("CREATE INDEX IF NOT EXISTS block_instances_inst ON block_instances(instance_id)");
+  // Transactions already committed, so a client re-sending one (its answer was lost) doesn't
+  // apply it twice.
+  db.exec(`CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    created_at INTEGER NOT NULL
+  )`);
   // Text ops appended per commit; folded into text_instances.state by compaction.
   db.exec(`CREATE TABLE IF NOT EXISTS text_ops (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,

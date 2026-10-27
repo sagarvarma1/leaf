@@ -160,6 +160,37 @@ async function onNewPage(p, prevUrl) {
   await p.locator(".leaf-editor .page-title").click();
 }
 
+/** Put the caret `offset` characters into the first occurrence of `needle` in the editor. */
+async function caretAt(p, needle, offset) {
+  await p.evaluate(
+    ({ needle, offset }) => {
+      const ed = window.__leafEditor;
+      let at = null;
+      ed.state.doc.descendants((node, pos) => {
+        if (at !== null || !node.isText) return at === null;
+        const i = node.text.indexOf(needle);
+        if (i >= 0) at = pos + i + offset;
+        return false;
+      });
+      ed.commands.focus();
+      ed.commands.setTextSelection(at);
+    },
+    { needle, offset },
+  );
+  await p.waitForFunction(() => document.activeElement?.classList.contains("ProseMirror"));
+  await sleep(50);
+}
+
+/** Text of each paragraph in the editor (list items' and toggles' text included), in order. */
+const paragraphs = (p) =>
+  p.evaluate(() =>
+    [...document.querySelectorAll("[data-testid=editor] p")].map((e) => {
+      const c = e.cloneNode(true);
+      c.querySelectorAll(".collaboration-cursor__caret").forEach((n) => n.remove());
+      return c.textContent;
+    }),
+  );
+
 async function caretToEnd(p) {
   // TipTap focuses on the next animation frame: wait until the editor really has focus.
   await p.evaluate(() => window.__leafEditor.commands.focus("end"));
@@ -490,6 +521,56 @@ async function main() {
       return a === b && (await docXml(A)) === (await docXml(B)) && a.includes("Bob wrote this offline") && a.includes("Alice wrote this while Bob was away");
     }, "converged after reconnect", 20_000);
   }
+
+  await test("Enter in the middle of a line someone is typing in: their text follows into the new block", async () => {
+    await caretToEnd(A);
+    await A.keyboard.press("Enter");
+    await A.keyboard.type("Hello wonderful world");
+    await until(async () => (await paragraphs(B)).includes("Hello wonderful world"), "Bob has the line");
+    // Bob, offline so the race is deterministic, types inside "world".
+    await ctxB.setOffline(true);
+    try {
+      await caretAt(B, "world", 2);
+      await B.keyboard.type("XYZ");
+      // Alice presses Enter right before "world".
+      await caretAt(A, "world", 0);
+      await A.keyboard.press("Enter");
+    } finally {
+      await ctxB.setOffline(false);
+    }
+    for (const p of [A, B]) {
+      await until(async () => {
+        const ps = await paragraphs(p);
+        const i = ps.indexOf("Hello wonderful ");
+        return i >= 0 && ps[i + 1] === "woXYZrld";
+      }, "Bob's typing is in the new block", 20_000);
+    }
+    assert((await docXml(A)) === (await docXml(B)), "identical documents");
+  });
+
+  await test("two tabs offline: a tab closed before reconnecting still delivers its edits", async () => {
+    const ctxT = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+    try {
+      const T1 = await login(ctxT, "alice");
+      await openPage(T1, "Scratchpad");
+      const T2 = await ctxT.newPage();
+      await T2.goto(T1.url());
+      await T2.waitForSelector("[data-testid=editor]", { timeout: 60_000 });
+      await ctxT.setOffline(true);
+      await caretToEnd(T1);
+      await T1.keyboard.press("Enter");
+      await T1.keyboard.type("from the closed tab");
+      await sleep(300);
+      await T1.close();
+      await caretToEnd(T2);
+      await T2.keyboard.press("Enter");
+      await T2.keyboard.type("from the open tab");
+      await ctxT.setOffline(false);
+      for (const line of ["from the closed tab", "from the open tab"]) await until(async () => (await editorText(B)).includes(line), `Bob gets "${line}"`, 30_000);
+    } finally {
+      await ctxT.close();
+    }
+  });
 
   await test("renaming in the editor title updates the other user's sidebar live", async () => {
     const prev = A.url();

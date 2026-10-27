@@ -245,14 +245,15 @@ Leaf AI is a tool-use loop with Claude Opus 5.5, running on the server. Its tool
 ## Testing
 
 ```bash
-pnpm test        # unit + integration (Vitest): 93 tests
+pnpm test        # unit + integration (Vitest): 104 tests
 pnpm typecheck   # tsc across all packages
-pnpm e2e         # 35 browser checks (Playwright, headless Chromium). Run `npx playwright install chromium` once.
+pnpm e2e         # 37 browser checks (Playwright, headless Chromium). Run `npx playwright install chromium` once.
 FUZZ=1000 FUZZ_STEPS=800 pnpm --filter @leaf/shared test   # the convergence simulation, at length
 pnpm --filter @leaf/shared bench editing-trace.json            # the editing-trace benchmark (see bench/)
+pnpm --filter @leaf/server exec tsx bench/load.ts 100 30        # 100 people typing on one page
 ```
 
-- **Sync engine** (packages/shared, 28, including 8 simulation seeds):
+- **Sync engine** (packages/shared, 34, including 8 engine and 6 editor-level simulation seeds):
   - Notion's own examples: concurrent inserts, splits with concurrent typing, merges with
     concurrent typing, concurrent splits.
   - Peritext rules (bold extends, links don't), and the editor bridge as a fixed point.
@@ -262,7 +263,11 @@ pnpm --filter @leaf/shared bench editing-trace.json            # the editing-tra
   - Out-of-order delivery.
   - **A randomized simulation:** a server and three clients make random typing, deletes,
     formatting, splits, merges, creates, moves and deletes, going offline and back, and every
-    replica must end identical to the server. It ran clean for 1,000 seeds of 800 steps.
+    replica must end identical to the server. Half the seeds add network faults (reordering,
+    duplicates, lost confirmations). It ran clean for 1,000 seeds of 800 steps.
+  - **The same through the editor bridge:** editor-shaped edits (typing, Enter, Backspace, turn
+    into, Tab, bullets, drag, delete) must converge, and every render must be a fixed point. It
+    ran clean for 300 seeds of 400 edits.
 - **Shared, other** (18): database ops, the formula language (precedence, dates, errors, "not
   eval"), rollups, cycle detection, filters/sorts on computed values, Markdown ↔ blocks.
 - **API** (22): auth, permissions, share links, the page tree, trash, REST block writes,
@@ -277,12 +282,17 @@ pnpm --filter @leaf/shared bench editing-trace.json            # the editing-tra
   a concurrent human edit**, and a block the AI wrote that a person typed into; cited answers;
   database edits by property name and their discard; refusing cross-page edits and bad input;
   one run per page.
+- **Hardening** (4): re-sent transactions apply once, a refused transaction leaves no trace in
+  memory, malformed ops are rejected, and another workspace's text can't be reached.
+- **Load** (1): 20 people typing on one page at once converge (the bench script runs 100).
 - **Sandboxes and tickets** (6): isolation, invite links, rate limits, a sweep that leaves nothing
   behind, and ticket signing, expiry, tampering and WebSocket auth.
-- **E2E** (35): Alice and Bob in separate browsers through:
+- **E2E** (37): Alice and Bob in separate browsers through:
   - presence, live and concurrent typing, the slash menu, markdown shortcuts, toolbar, per-user undo;
   - nesting and turn-into-with-children, columns via slash and drag-to-edge, drag reorder, block menu;
   - mentions, offline merge, sidebar operations;
+  - **Enter in the middle of a line someone is typing in** (their text follows into the new
+    block), and two tabs offline with one closed before reconnecting;
   - **offline mode with the network really cut** (service worker included): cold reload, open a
     never-visited page, edit, reload again, then reconnect and converge with an online editor;
   - database table, board, filter, sort, relations, rollups, formulas (with live preview),
