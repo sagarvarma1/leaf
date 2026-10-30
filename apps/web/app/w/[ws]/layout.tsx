@@ -18,6 +18,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const pageId = params.slug?.[0] ?? null;
   const loaded = useWorkspace((s) => s.loaded && s.workspaceId === ws);
   const [sidebar, setSidebar] = useState(true);
+  // On a phone the sidebar covers the page: start closed, and close it after picking a page.
+  useEffect(() => {
+    if (window.matchMedia("(max-width: 860px)").matches) setSidebar(false);
+  }, [pageId]);
   const [overlay, setOverlay] = useState<null | "search" | "trash" | "settings">(null);
   const online = useOnline();
   useServiceWorker();

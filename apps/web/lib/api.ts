@@ -13,13 +13,14 @@ let shareToken: string | null = null;
 export const setShareToken = (t: string | null) => (shareToken = t);
 export const getShareToken = () => shareToken;
 
-export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
+export async function api<T = any>(method: string, path: string, body?: unknown, opts: { timeoutMs?: number } = {}): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["content-type"] = "application/json";
   if (shareToken) headers["x-leaf-share"] = shareToken;
   let res: Response;
   try {
-    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
+    const signal = opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined;
+    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin", signal });
   } catch {
     // Reads are served from the offline cache by the service worker; anything that still
     // fails needs the server (creating pages, database edits, comments).

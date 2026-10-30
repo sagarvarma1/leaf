@@ -572,6 +572,46 @@ async function main() {
     }
   });
 
+  await test("saves that fail with a server error (a redeploy) are retried without a reconnect", async () => {
+    const ctxR = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+    try {
+      const R = await login(ctxR, "alice");
+      await openPage(R, "Scratchpad");
+      let failed = 0;
+      await R.route("**/api/saveTransactions", (route) => (failed++, route.fulfill({ status: 502, body: "Bad Gateway" })));
+      await caretToEnd(R);
+      await R.keyboard.press("Enter");
+      await R.keyboard.type("survives a redeploy");
+      await until(async () => failed >= 2, "saves fail and are retried", 15_000);
+      await R.unroute("**/api/saveTransactions");
+      await until(async () => (await editorText(B)).includes("survives a redeploy"), "Bob gets the retried edit", 30_000);
+      await until(async () => (await R.evaluate(() => window.__leafSync.debug().pending)) === 0, "queue drains", 10_000);
+    } finally {
+      await ctxR.close();
+    }
+  });
+
+  await test("a device whose local database never opens still syncs its edits", async () => {
+    const ctxI = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+    try {
+      // What another tab's blocked delete does: every open waits forever.
+      await ctxI.addInitScript(() => {
+        indexedDB.open = () => ({});
+      });
+      const I = await login(ctxI, "alice");
+      await openPage(I, "Scratchpad");
+      await caretToEnd(I);
+      await I.keyboard.press("Enter");
+      await I.keyboard.type("first line");
+      await I.keyboard.press("Enter");
+      await I.keyboard.type("and a second one");
+      await until(async () => (await editorText(B)).includes("and a second one"), "Bob gets every edit", 30_000);
+      await until(async () => (await I.evaluate(() => window.__leafSync.debug().pending)) === 0, "queue drains", 15_000);
+    } finally {
+      await ctxI.close();
+    }
+  });
+
   await test("renaming in the editor title updates the other user's sidebar live", async () => {
     const prev = A.url();
     await A.locator("[data-testid=new-page]").click();

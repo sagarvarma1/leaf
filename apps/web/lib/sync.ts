@@ -57,6 +57,9 @@ interface StoredQueue {
 }
 
 const QUEUE_HEARTBEAT_MS = 10_000;
+/** A save that takes longer than this is abandoned and sent again (the server applies a transaction once). */
+const SAVE_TIMEOUT_MS = 20_000;
+const RETRY_MAX_MS = 30_000;
 const QUEUE_ORPHAN_MS = 30_000;
 
 interface UndoEntry {
@@ -91,6 +94,8 @@ export class SyncClient {
   private undoStack = new Map<string, UndoEntry[]>();
   private redoStack = new Map<string, UndoEntry[]>();
   private sending = false;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryDelay = 1_000;
   private saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private sender: ((msg: unknown) => void) | null = null;
   connected = false;
@@ -114,7 +119,7 @@ export class SyncClient {
 
   /** For debugging and tests. */
   debug() {
-    return { session: this.session, userId: this.userId, connected: this.connected, open: [...this.open.keys()], loaded: [...this.loaded.keys()], pending: this.pendingCount };
+    return { session: this.session, userId: this.userId, connected: this.connected, open: [...this.open.keys()], loaded: [...this.loaded.keys()], pending: this.pendingCount, sending: this.sending, retrying: !!this.retryTimer };
   }
 
   get view(): MemoryState {
@@ -442,9 +447,9 @@ export class SyncClient {
         const batch = this.replica.pending.slice(0, 100);
         let res: { commits: Commit[] };
         try {
-          res = await api<{ commits: Commit[] }>("POST", "/api/saveTransactions", { transactions: batch, session: this.session });
+          res = await api<{ commits: Commit[] }>("POST", "/api/saveTransactions", { transactions: batch, session: this.session }, { timeoutMs: SAVE_TIMEOUT_MS });
         } catch (e) {
-          if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
+          if (e instanceof ApiError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) {
             console.warn(`[leaf] transactions refused (${e.status}): ${e.message}`);
             // Refused (permissions, bad op): drop the batch and reload from the server.
             for (const tx of batch) this.replica.reject(tx.id);
@@ -452,18 +457,32 @@ export class SyncClient {
             this.notify("reject");
             continue;
           }
-          break; // network: retry when back online / reconnected
+          // Network, timeout or server error (a redeploy, a proxy hiccup): try again with
+          // backoff, and sooner when the browser comes back online or the socket reconnects.
+          this.scheduleRetry();
+          break;
         }
+        this.retryDelay = 1_000;
         for (const c of res.commits) {
           this.replica.receive(c);
           this.afterCommit(c);
         }
-        await this.persistQueue();
+        void this.persistQueue();
         this.notify("ack");
       }
     } finally {
       this.sending = false;
     }
+  }
+
+  private scheduleRetry() {
+    if (this.retryTimer) return;
+    const delay = this.retryDelay;
+    this.retryDelay = Math.min(this.retryDelay * 2, RETRY_MAX_MS);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.flush();
+    }, delay);
   }
 
   // ------------------------------------------------------------ presence
