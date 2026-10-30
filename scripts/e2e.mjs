@@ -861,6 +861,21 @@ async function main() {
     await ctxG.close();
   });
 
+  await test("narrowing the window closes the sidebar; widening reopens it", async () => {
+    const ctxW = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+    try {
+      const W = await login(ctxW, "alice");
+      const open = () => W.locator("[data-testid=sidebar]").isVisible();
+      await until(open, "sidebar open when wide");
+      await W.setViewportSize({ width: 600, height: 860 });
+      await until(async () => !(await open()), "sidebar closes when narrow");
+      await W.setViewportSize({ width: 1280, height: 860 });
+      await until(open, "sidebar reopens when wide");
+    } finally {
+      await ctxW.close();
+    }
+  });
+
   await test("dark mode toggle", async () => {
     await A.click("[data-testid=theme-toggle]");
     assert((await A.evaluate(() => document.documentElement.dataset.theme)) === "dark", "dark");

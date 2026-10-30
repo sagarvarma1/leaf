@@ -18,10 +18,17 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const pageId = params.slug?.[0] ?? null;
   const loaded = useWorkspace((s) => s.loaded && s.workspaceId === ws);
   const [sidebar, setSidebar] = useState(true);
-  // On a phone the sidebar covers the page: start closed, and close it after picking a page.
+  // In a narrow window the sidebar covers the page: start closed, close it after picking a
+  // page, and close or reopen it as the window is resized across the breakpoint.
   useEffect(() => {
     if (window.matchMedia("(max-width: 860px)").matches) setSidebar(false);
   }, [pageId]);
+  useEffect(() => {
+    const narrow = window.matchMedia("(max-width: 860px)");
+    const onChange = () => setSidebar(!narrow.matches);
+    narrow.addEventListener("change", onChange);
+    return () => narrow.removeEventListener("change", onChange);
+  }, []);
   const [overlay, setOverlay] = useState<null | "search" | "trash" | "settings">(null);
   const online = useOnline();
   useServiceWorker();
