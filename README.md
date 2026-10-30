@@ -384,3 +384,7 @@ on WebSockets (see DEPLOY.md). Share-link access uses `x-leaf-share: <token>` or
 `.env` (see `.env.example`): `API_PORT` (4000), `WEB_PORT` (3000), `LEAF_DATA_DIR` (`data`),
 `LEAF_SEED` (1), `ANTHROPIC_API_KEY` or `LEAF_AI_MOCK=1`, and the guest/AI limits documented in
 [DEPLOY.md](DEPLOY.md). Set `API_HOST=127.0.0.1` to keep the API off your LAN.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
